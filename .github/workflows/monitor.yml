@@ -1,0 +1,41 @@
+name: BTC ETF and COT Monitor
+
+on:
+  workflow_dispatch: # 允许你在网页上手动点按钮测试
+  schedule:
+    # 1. 每个交易日北京时间 06:30 - 12:00（UTC 22:30 - 04:00）每 30 分钟检查 ETF 资金流
+    - cron: '30 22,23 * * 1-5'
+    - cron: '0,30 0-4 * * 2-6'
+    # 2. 每周六北京时间 03:30 - 05:30（UTC 周五 19:30 - 21:30）每 15 分钟检查 CFTC 持仓周报
+    - cron: '*/15 19-21 * * 5'
+
+permissions:
+  contents: write # 允许脚本更新本地去重状态文件
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 cloudscraper
+
+      - name: Run monitor script
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python etf_cot_monitor.py
+
+      - name: Save deduplication state
+        run: |
+          git config --local user.email "bot@github.com"
+          git config --local user.name "Monitor Bot"
+          git add monitor_state.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update monitor state" && git push)

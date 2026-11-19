@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CME CFTC 杠杆基金净空头 & 美国现货 BTC ETF 资金流监控告警脚本
-数据源:
-  1. CFTC TFF Report: https://www.cftc.gov/dea/futures/financial_lf.htm
-  2. Farside BTC ETF Flow: https://farside.co.uk/btc/
+CME CFTC 杠杆基金净空头 & 美国现货 BTC ETF 资金流监控告警脚本 (V2 云端防屏蔽版)
 """
 
 import os
@@ -13,38 +10,35 @@ import sys
 import json
 import logging
 import argparse
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 
-# ==================== 配置区（建议使用环境变量覆盖） ====================
+# ==================== 配置区 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
-CFTC_URL = "https://www.cftc.gov/dea/futures/financial_lf.htm"
-FARSIDE_URL = "https://farside.co.uk/btc/"
+# CFTC 官方开放数据 API (TFF 金融期货持仓报告) & 网页备用源
+CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+CFTC_HTML_URL = "https://www.cftc.gov/dea/futures/financial_lf.htm"
 
-# 告警阈值配置
+# Farside ETF 边缘防屏蔽源 & 直连备用源
+FARSIDE_JINA_URL = "https://r.jina.ai/https://farside.co.uk/btc/"
+FARSIDE_DIRECT_URL = "https://farside.co.uk/btc/"
+
 THRESHOLDS = {
-    # IBIT 单日净流出超过该值（百万美元）触发大额失血警报
-    "IBIT_HEAVY_OUTFLOW_M": -150.0,
-    # 全市场 ETF 单日净流入超过该值（百万美元）触发买盘回流警报
-    "TOTAL_INFLOW_ALERT_M": 100.0,
-    # IBIT 连续净流入达到该天数，触发“套利/抛压止血右侧信号”
-    "IBIT_INFLOW_STREAK_DAYS": 2,
-    # CFTC 杠杆基金净空头单周变化超过该张数（1张 = 5 BTC）触发剧烈调仓警报
-    "COT_NET_CHANGE_CONTRACTS": 1000,
-    # CFTC 杠杆基金剩余净空头低于该张数，提示“套利平仓已近枯竭”
-    "COT_UNWIND_EXHAUSTED_CONTRACTS": 3000,
+    "IBIT_HEAVY_OUTFLOW_M": -150.0,        # IBIT 单日净流出警报阈值（百万美元）
+    "TOTAL_INFLOW_ALERT_M": 100.0,         # 全市场 ETF 单日净流入警报阈值（百万美元）
+    "IBIT_INFLOW_STREAK_DAYS": 2,          # IBIT 连续净流入右侧反转天数阈值
+    "COT_NET_CHANGE_CONTRACTS": 1000,      # CFTC 杠杆基金单周调仓张数阈值
+    "COT_UNWIND_EXHAUSTED_CONTRACTS": 3000 # CFTC 杠杆基金套利空头枯竭阈值
 }
 
-# ==================== 日志初始化 ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -72,9 +66,11 @@ def save_state(state: Dict) -> None:
 
 
 def send_telegram_message(text: str) -> bool:
-    if "YOUR_TELEGRAM" in TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM" in TELEGRAM_CHAT_ID:
-        logger.error("未配置有效的 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID！")
-        print("\n--- 模拟推送消息预览 ---\n" + text + "\n------------------------\n")
+    if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM" in TELEGRAM_BOT_TOKEN:
+        logger.error("未配置有效的 TELEGRAM_BOT_TOKEN！")
+        return False
+    if not TELEGRAM_CHAT_ID or "YOUR_TELEGRAM" in TELEGRAM_CHAT_ID:
+        logger.error("未配置有效的 TELEGRAM_CHAT_ID！")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -85,112 +81,128 @@ def send_telegram_message(text: str) -> bool:
         "disable_web_page_preview": True,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code != 200:
+            logger.error(f"Telegram API 返回错误 ({resp.status_code}): {resp.text}")
+            return False
         logger.info("Telegram 告警推送成功。")
         return True
     except Exception as e:
-        logger.error(f"Telegram 推送失败: {e}")
+        logger.error(f"Telegram 网络请求失败: {e}")
         return False
 
 
-# ==================== 1. CFTC COT 解析模块 ====================
+# ==================== 1. CFTC COT 解析模块（双源保障） ====================
 def fetch_cftc_btc_cot() -> Optional[Dict]:
-    """
-    抓取并解析 CFTC Traders in Financial Futures (financial_lf.htm)
-    锁定标准合约: BITCOIN - CHICAGO MERCANTILE EXCHANGE (CFTC Code #133741, 5 BTC/张)
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
-    }
+    # 通道 A：优先请求 CFTC 官方结构化 JSON API（最稳定，不受网页排版影响）
     try:
-        resp = requests.get(CFTC_URL, headers=headers, timeout=30)
+        params = {
+            "cftc_contract_market_code": "133741",
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$limit": 2,
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(CFTC_API_URL, params=params, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and len(data) > 0:
+                latest = data[0]
+                report_date = str(latest.get("report_date_as_yyyy_mm_dd", ""))[:10]
+                oi = int(float(latest.get("open_interest_all", 0)))
+                lev_long = int(float(latest.get("lev_money_positions_long", 0)))
+                lev_short = int(float(latest.get("lev_money_positions_short", 0)))
+                lev_spread = int(float(latest.get("lev_money_positions_spread", 0)))
+                lev_net = lev_long - lev_short
+
+                chg_long = int(float(latest.get("change_in_lev_money_long", 0)))
+                chg_short = int(float(latest.get("change_in_lev_money_short", 0)))
+                lev_net_chg = chg_long - chg_short
+
+                logger.info(f"成功通过 CFTC 官方 API 获取报告 ({report_date})")
+                return {
+                    "report_date": report_date,
+                    "open_interest_contracts": oi,
+                    "open_interest_btc": oi * 5,
+                    "lev_long": lev_long,
+                    "lev_short": lev_short,
+                    "lev_spread": lev_spread,
+                    "lev_net_contracts": lev_net,
+                    "lev_net_btc": lev_net * 5,
+                    "lev_net_chg_contracts": lev_net_chg,
+                    "lev_net_chg_btc": lev_net_chg * 5,
+                }
+    except Exception as e:
+        logger.warning(f"CFTC 官方 API 请求异常，切换至网页备用解析: {e}")
+
+    # 通道 B：CFTC 网页备用解析（兼容 CFTC Code # 133741 空格格式）
+    try:
+        resp = requests.get(CFTC_HTML_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         resp.raise_for_status()
         raw_text = resp.text
+
+        pattern = re.compile(
+            r"BITCOIN\s*-\s*CHICAGO MERCANTILE EXCHANGE.*?133741.*?(?=CFTC Code #|\Z)",
+            re.DOTALL | re.IGNORECASE,
+        )
+        match = pattern.search(raw_text)
+        if not match:
+            logger.error("CFTC 备用网页仍未匹配到 133741 区块。")
+            return None
+
+        block = match.group(0)
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+
+        report_date = "Unknown"
+        open_interest = 0
+        pos_nums: List[int] = []
+        chg_nums: List[int] = []
+
+        for i, line in enumerate(lines):
+            if "Open Interest is" in line:
+                oi_m = re.search(r"Open Interest is\s+([\d,]+)", line)
+                if oi_m:
+                    open_interest = int(oi_m.group(1).replace(",", ""))
+            if "Positions as of" in line:
+                d_m = re.search(r"([A-Za-z]+\s+\d{1,2},\s+\d{4})", line)
+                if d_m:
+                    report_date = d_m.group(1)
+            if line.startswith("All") and not pos_nums:
+                nums = [int(x.replace(",", "")) for x in re.findall(r"-?[\d,]+", line)]
+                if len(nums) >= 14:
+                    pos_nums = nums
+            if line.startswith("Changes from:") and i + 1 < len(lines) and not chg_nums:
+                nums = [int(x.replace(",", "")) for x in re.findall(r"[+-]?[\d,]+", lines[i + 1])]
+                if len(nums) >= 14:
+                    chg_nums = nums
+
+        if len(pos_nums) < 14:
+            logger.error("CFTC 网页持仓数字列不完整。")
+            return None
+
+        lev_long, lev_short, lev_spread = pos_nums[6], pos_nums[7], pos_nums[8]
+        lev_net = lev_long - lev_short
+        lev_net_chg = (chg_nums[6] - chg_nums[7]) if len(chg_nums) >= 14 else 0
+
+        return {
+            "report_date": report_date,
+            "open_interest_contracts": open_interest,
+            "open_interest_btc": open_interest * 5,
+            "lev_long": lev_long,
+            "lev_short": lev_short,
+            "lev_spread": lev_spread,
+            "lev_net_contracts": lev_net,
+            "lev_net_btc": lev_net * 5,
+            "lev_net_chg_contracts": lev_net_chg,
+            "lev_net_chg_btc": lev_net_chg * 5,
+        }
     except Exception as e:
-        logger.error(f"获取 CFTC 报告失败: {e}")
+        logger.error(f"CFTC 备用网页解析失败: {e}")
         return None
 
-    # 精确匹配标准 CME 比特币合约区块（排除 MICRO BITCOIN）
-    pattern = re.compile(
-        r"(?m)^BITCOIN - CHICAGO MERCANTILE EXCHANGE\s+CFTC Code #133741.*?(?=\n[A-Z0-9\s\-/]+CFTC Code #|\Z)",
-        re.DOTALL,
-    )
-    match = pattern.search(raw_text)
-    if not match:
-        logger.error("未能在 CFTC 报告中匹配到标准 BITCOIN (#133741) 区块。")
-        return None
 
-    block = match.group(0)
-    lines = [line.strip() for line in block.splitlines() if line.strip()]
-
-    # 提取报告截止日期 (如: Positions as of November 10, 2026)
-    report_date = "Unknown"
-    open_interest = 0
-    pos_nums: List[int] = []
-    chg_nums: List[int] = []
-
-    for i, line in enumerate(lines):
-        if "Open Interest is" in line:
-            oi_match = re.search(r"Open Interest is\s+([\d,]+)", line)
-            if oi_match:
-                open_interest = int(oi_match.group(1).replace(",", ""))
-
-        if line.startswith("Positions") or "Futures Only Positions as of" in line:
-            date_match = re.search(r"([A-Za-z]+\s+\d{1,2},\s+\d{4})", line)
-            if date_match:
-                report_date = date_match.group(1)
-
-        # 提取 Positions 数值行（包含 14 个整数：Dealer[3], AssetMgr[3], LevFunds[3], Other[3], NonRep[2]）
-        if line.startswith("All") and not pos_nums:
-            nums = [int(x.replace(",", "")) for x in re.findall(r"-?[\d,]+", line)]
-            if len(nums) >= 14:
-                pos_nums = nums
-
-        # 兼容部分格式中数字直接在 Positions 下一行的情况
-        if line == "Positions" and i + 1 < len(lines) and not pos_nums:
-            nums = [int(x.replace(",", "")) for x in re.findall(r"-?[\d,]+", lines[i + 1])]
-            if len(nums) >= 14:
-                pos_nums = nums
-
-        # 提取 Changes from 周度变化数值行
-        if line.startswith("Changes from:") and i + 1 < len(lines) and not chg_nums:
-            nums = [int(x.replace(",", "")) for x in re.findall(r"[+-]?[\d,]+", lines[i + 1])]
-            if len(nums) >= 14:
-                chg_nums = nums
-
-    if len(pos_nums) < 14:
-        logger.error("CFTC 持仓数字列解析不完整，请检查网页格式。")
-        return None
-
-    # TFF 报告列索引: [6]=Lev_Long, [7]=Lev_Short, [8]=Lev_Spreading
-    lev_long = pos_nums[6]
-    lev_short = pos_nums[7]
-    lev_spread = pos_nums[8]
-    lev_net = lev_long - lev_short  # 负值代表净空头
-
-    lev_net_chg = 0
-    if len(chg_nums) >= 14:
-        lev_net_chg = chg_nums[6] - chg_nums[7]
-
-    return {
-        "report_date": report_date,
-        "open_interest_contracts": open_interest,
-        "open_interest_btc": open_interest * 5,
-        "lev_long": lev_long,
-        "lev_short": lev_short,
-        "lev_spread": lev_spread,
-        "lev_net_contracts": lev_net,
-        "lev_net_btc": lev_net * 5,
-        "lev_net_chg_contracts": lev_net_chg,
-        "lev_net_chg_btc": lev_net_chg * 5,
-    }
-
-
-# ==================== 2. Farside 现货 ETF 解析模块 ====================
+# ==================== 2. 现货 ETF 资金流解析模块（防 403 双通道） ====================
 def parse_farside_number(val: str) -> float:
-    """将 Farside 表格单元格转为浮点数，例如 '(209.5)' -> -209.5, '-' -> 0.0"""
-    s = val.strip().replace(",", "")
+    s = val.strip().replace(",", "").replace("$", "")
     if not s or s == "-" or s.lower() == "n/a":
         return 0.0
     if s.startswith("(") and s.endswith(")"):
@@ -201,63 +213,10 @@ def parse_farside_number(val: str) -> float:
         return 0.0
 
 
-def fetch_farside_etf_flows() -> Optional[Dict]:
-    """抓取并解析 Farside Investors 美国现货 BTC ETF 每日资金流"""
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "linux", "mobile": False}
-    )
-    try:
-        resp = scraper.get(FARSIDE_URL, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"获取 Farside ETF 数据失败: {e}")
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    target_table = None
-    for table in soup.find_all("table"):
-        text = table.get_text()
-        if "IBIT" in text and "Total" in text:
-            target_table = table
-            break
-
-    if not target_table:
-        logger.error("未在 Farside 页面找到包含 IBIT 的数据表。")
-        return None
-
-    rows = target_table.find_all("tr")
-    headers: List[str] = []
-    daily_records: List[Dict] = []
-
-    date_regex = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
-
-    for tr in rows:
-        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-        if not cells:
-            continue
-
-        # 识别表头行
-        if "IBIT" in cells and "Total" in cells:
-            headers = cells
-            continue
-
-        # 仅保留日期格式的有效交易日行（自动排除底部的 Total / Average / Maximum 汇总行）
-        if headers and date_regex.match(cells[0]) and len(cells) >= len(headers):
-            row_dict = {"Date": cells[0]}
-            for idx in range(1, len(headers)):
-                ticker = headers[idx]
-                row_dict[ticker] = parse_farside_number(cells[idx])
-            daily_records.append(row_dict)
-
-    if not daily_records:
-        logger.error("Farside ETF 有效交易日记录为空。")
-        return None
-
+def build_etf_summary(daily_records: List[Dict]) -> Dict:
     latest = daily_records[-1]
-
-    # 计算 IBIT 连续净流入或净流出天数
     streak_days = 0
-    streak_dir = 0  # 1=净流入, -1=净流出
+    streak_dir = 0
     for rec in reversed(daily_records):
         ibit_val = rec.get("IBIT", 0.0)
         if ibit_val == 0:
@@ -271,9 +230,7 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
         else:
             break
 
-    # 迷你低费率 ETF 合并流向 (Grayscale BTC + Bitwise BITB)
     mini_flow = latest.get("BTC", 0.0) + latest.get("BITB", 0.0)
-
     return {
         "date": latest["Date"],
         "ibit": latest.get("IBIT", 0.0),
@@ -281,8 +238,83 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
         "gbtc": latest.get("GBTC", 0.0),
         "mini_flow": round(mini_flow, 2),
         "total": latest.get("Total", 0.0),
-        "ibit_streak_days": streak_days * streak_dir,  # 正数为连涨天数，负数为连跌天数
+        "ibit_streak_days": streak_days * streak_dir,
     }
+
+
+def fetch_farside_etf_flows() -> Optional[Dict]:
+    date_regex = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
+
+    # 通道 A：通过边缘阅读节点抓取（解决 GitHub Actions 云服务器 IP 被 Cloudflare 403 拦截问题）
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/plain, text/markdown, */*",
+        }
+        resp = requests.get(FARSIDE_JINA_URL, headers=headers, timeout=30)
+        if resp.status_code == 200 and "IBIT" in resp.text:
+            headers_list: List[str] = []
+            daily_records: List[Dict] = []
+
+            for line in resp.text.splitlines():
+                if "|" not in line:
+                    continue
+                cells = [c.strip() for c in line.split("|") if c.strip()]
+                if not cells:
+                    continue
+                if "IBIT" in cells and "Total" in cells:
+                    headers_list = cells
+                    continue
+                if headers_list and date_regex.match(cells[0]) and len(cells) >= len(headers_list):
+                    row_dict = {"Date": cells[0]}
+                    for idx in range(1, len(headers_list)):
+                        row_dict[headers_list[idx]] = parse_farside_number(cells[idx])
+                    daily_records.append(row_dict)
+
+            if daily_records:
+                logger.info(f"成功通过边缘防屏蔽节点获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
+                return build_etf_summary(daily_records)
+    except Exception as e:
+        logger.warning(f"边缘节点获取 ETF 数据异常，尝试直连备用通道: {e}")
+
+    # 通道 B：直连 Farside HTML 表格（适合本地电脑运行）
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        resp = scraper.get(FARSIDE_DIRECT_URL, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        target_table = None
+        for table in soup.find_all("table"):
+            if "IBIT" in table.get_text() and "Total" in table.get_text():
+                target_table = table
+                break
+
+        if target_table:
+            headers_list = []
+            daily_records = []
+            for tr in target_table.find_all("tr"):
+                cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+                if not cells:
+                    continue
+                if "IBIT" in cells and "Total" in cells:
+                    headers_list = cells
+                    continue
+                if headers_list and date_regex.match(cells[0]) and len(cells) >= len(headers_list):
+                    row_dict = {"Date": cells[0]}
+                    for idx in range(1, len(headers_list)):
+                        row_dict[headers_list[idx]] = parse_farside_number(cells[idx])
+                    daily_records.append(row_dict)
+
+            if daily_records:
+                logger.info(f"成功通过直连通道获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
+                return build_etf_summary(daily_records)
+    except Exception as e:
+        logger.error(f"直连通道获取 Farside ETF 数据失败: {e}")
+
+    return None
 
 
 # ==================== 3. 告警规则评估与消息组装 ====================
@@ -294,10 +326,8 @@ def evaluate_and_alert(force: bool = False) -> None:
     alerts_triggered: List[str] = []
     has_new_data = False
 
-    # --- 检查 ETF 数据 ---
     if etf_data:
-        is_new_etf = etf_data["date"] != state.get("last_etf_date")
-        if is_new_etf:
+        if etf_data["date"] != state.get("last_etf_date"):
             has_new_data = True
             state["last_etf_date"] = etf_data["date"]
 
@@ -314,10 +344,8 @@ def evaluate_and_alert(force: bool = False) -> None:
         if ibit < -50 and etf_data["mini_flow"] > 0:
             alerts_triggered.append("⚠️ <b>筹码结构分化</b>：巨鲸通道 IBIT 流出，但低费率迷你 ETF 保持净流入")
 
-    # --- 检查 CFTC COT 数据 ---
     if cot_data:
-        is_new_cot = cot_data["report_date"] != state.get("last_cot_date")
-        if is_new_cot:
+        if cot_data["report_date"] != state.get("last_cot_date"):
             has_new_data = True
             state["last_cot_date"] = cot_data["report_date"]
 
@@ -334,12 +362,10 @@ def evaluate_and_alert(force: bool = False) -> None:
                 f"🧊 <b>期现套利空头已近枯竭</b>：杠杆基金净空头仅剩 {abs(net_contracts):,} 张 ({abs(cot_data['lev_net_btc']):,} BTC)"
             )
 
-    # 仅在有新数据更新，或用户手动指定 --force 时发送通知
     if not has_new_data and not force:
         logger.info("暂无新的 ETF 或 CFTC 报告数据发布，跳过推送。")
         return
 
-    # 构建 Telegram 战报
     msg_lines = ["<b>📡 华尔街 BTC 机构资金与衍生品监控战报</b>\n"]
 
     if alerts_triggered:
@@ -359,6 +385,8 @@ def evaluate_and_alert(force: bool = False) -> None:
             f"• <b>低费率迷你盘 (BTC+BITB):</b> <code>{etf_data['mini_flow']:+.1f}M</code>",
             "",
         ])
+    else:
+        msg_lines.append("⚠️ <i>本次未获取到现货 ETF 数据（数据源可能正在更新中）</i>\n")
 
     if cot_data:
         net_c = cot_data["lev_net_contracts"]
@@ -370,9 +398,11 @@ def evaluate_and_alert(force: bool = False) -> None:
             f"• <b>单周净头寸变化:</b> <code>{cot_data['lev_net_chg_contracts']:+d}</code> 张 ({cot_data['lev_net_chg_btc']:+d} BTC)",
             f"• <b>多空明细:</b> 多单 {cot_data['lev_long']:,} / 空单 {cot_data['lev_short']:,} / 套利展期 {cot_data['lev_spread']:,}",
         ])
+    else:
+        msg_lines.append("⚠️ <i>本次未获取到 CFTC 周度持仓报告</i>")
 
     final_message = "\n".join(msg_lines)
-    if send_telegram_message(final_message) or force:
+    if send_telegram_message(final_message) and has_new_data:
         save_state(state)
 
 

@@ -3,9 +3,13 @@ name: BTC ETF and COT Monitor
 on:
   workflow_dispatch:
   schedule:
+    # 1. 每个交易日美股盘后（北京时间 06:30-12:00 / UTC 22:30-04:00）每 30 分钟检测 ETF 资金流
     - cron: '30 22,23 * * 1-5'
     - cron: '0,30 0-4 * * 2-6'
+    # 2. 每周六凌晨（北京时间 03:30-05:30 / UTC 周五 19:30-21:30）每 15 分钟检测 CFTC 周报
     - cron: '*/15 19-21 * * 5'
+    # 3. 新增：美盘主力交易时段（北京时间 21:30 至次日 04:30 / UTC 13:30-20:30）每小时扫描 Coinbase 溢价
+    - cron: '30 13-20 * * 1-5'
 
 permissions:
   contents: write
@@ -32,6 +36,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python etf_cot_monitor.py --force
+          elif [ "${{ github.event.schedule }}" = "30 13-20 * * 1-5" ]; then
+            python etf_cot_monitor.py --intraday
           else
             python etf_cot_monitor.py
           fi

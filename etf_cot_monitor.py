@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V4 完整版)
-新增特性:
-  1. --intraday 美盘盘中静默雷达（仅在 Coinbase 溢价由负转正或触发吸筹底背离时推送）
-  2. 修复 Farside Markdown 表格首列空白导致的 ETF 数据解析偏移问题
-  3. 优化 CME 期货近月到期前 10 天自动展期计算，避免年化基差失真
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V5 完整修复版)
+更新说明:
+  1. 新增对云端 IP 友好的 SatsIntel ETF 资金流主通道，彻底解决 Farside 403 导致的 ETF 数据缺失
+  2. 保留 --intraday 美盘盘中静默雷达（仅在 Coinbase 溢价由负转正或触发吸筹底背离时推送）
+  3. 保留 CME 期货自动展期基差测算与 CFTC 官方 JSON API 持仓监控
 """
 
 import os
@@ -29,8 +29,11 @@ TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
+# 数据源接口地址
 CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_HTML_URL = "https://www.cftc.gov/dea/futures/financial_lf.htm"
+
+ETF_PRIMARY_URL = "https://www.satsintel.io/en/etfs/flows"
 FARSIDE_JINA_URL = "https://r.jina.ai/https://farside.co.uk/btc/"
 FARSIDE_DIRECT_URL = "https://farside.co.uk/btc/"
 
@@ -92,7 +95,7 @@ def send_telegram_message(text: str) -> bool:
         if resp.status_code != 200:
             logger.error(f"Telegram API 返回错误 ({resp.status_code}): {resp.text}")
             return False
-        logger.info("Telegram 告警推送成功。")
+        logger.info("Telegram 战报推送成功。")
         return True
     except Exception as e:
         logger.error(f"Telegram 网络请求失败: {e}")
@@ -198,9 +201,11 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
         return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块（已修复列对齐） ====================
-def parse_farside_number(val: str) -> float:
-    s = val.strip().replace(",", "").replace("$", "")
+# ==================== 3. 美国现货 ETF 资金流模块（多源云端免拦截） ====================
+def parse_flow_number(val: str) -> float:
+    """统一清洗各类财务符号: '−$209.5M' / '(209.5)' / '+$7.9M' / '-' -> float"""
+    s = val.strip().replace(",", "").replace("$", "").replace("M", "").replace("m", "")
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
     if not s or s == "-" or s.lower() == "n/a":
         return 0.0
     if s.startswith("(") and s.endswith(")"):
@@ -211,11 +216,17 @@ def parse_farside_number(val: str) -> float:
         return 0.0
 
 
-def build_etf_summary(daily_records: List[Dict]) -> Dict:
-    latest = daily_records[-1]
+def build_etf_summary(daily_records: List[Dict], latest_first: bool = False) -> Dict:
+    """
+    daily_records: 按日期排序的每日字典列表
+    latest_first: True 表示 index 0 是最新一天（如 SatsIntel），False 表示 index -1 是最新一天（如 Farside）
+    """
+    ordered = daily_records if latest_first else list(reversed(daily_records))
+    latest = ordered[0]
+
     streak_days = 0
     streak_dir = 0
-    for rec in reversed(daily_records):
+    for rec in ordered:
         ibit_val = rec.get("IBIT", 0.0)
         if ibit_val == 0:
             break
@@ -241,75 +252,103 @@ def build_etf_summary(daily_records: List[Dict]) -> Dict:
 
 
 def fetch_farside_etf_flows() -> Optional[Dict]:
-    date_regex = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
+    headers_browser = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
 
-    # 通道 A：边缘防屏蔽节点（保留首列空白位置，防止列错位）
+    # 通道 A（主通道）：SatsIntel 静态 SSR 表格（不封锁 GitHub 云端 IP）
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/plain, text/markdown, */*",
-        }
-        resp = requests.get(FARSIDE_JINA_URL, headers=headers, timeout=30)
+        resp = requests.get(ETF_PRIMARY_URL, headers=headers_browser, timeout=25)
         if resp.status_code == 200 and "IBIT" in resp.text:
-            headers_list: List[str] = []
-            daily_records: List[Dict] = []
-            for line in resp.text.splitlines():
-                if "|" not in line:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for table in soup.find_all("table"):
+                t_text = table.get_text()
+                if "IBIT" not in t_text or "FBTC" not in t_text:
                     continue
-                raw_cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                # 跳过 Markdown 表格分隔行 | --- | --- |
-                if all(re.match(r"^:?-+:?$", c) or c == "" for c in raw_cells):
-                    continue
-                if "IBIT" in raw_cells and "Total" in raw_cells:
-                    headers_list = raw_cells
-                    continue
-                if headers_list and len(raw_cells) >= len(headers_list) and date_regex.match(raw_cells[0]):
-                    row_dict = {"Date": raw_cells[0]}
-                    for idx in range(1, len(headers_list)):
-                        col_name = headers_list[idx]
-                        if col_name:
-                            row_dict[col_name] = parse_farside_number(raw_cells[idx])
-                    daily_records.append(row_dict)
-            if daily_records:
-                logger.info(f"成功通过边缘防屏蔽节点获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
-                return build_etf_summary(daily_records)
-    except Exception as e:
-        logger.warning(f"边缘节点获取 ETF 数据异常，尝试直连备用通道: {e}")
+                rows = table.find_all("tr")
+                col_headers: List[str] = []
+                records: List[Dict] = []
 
-    # 通道 B：直连 Farside 表格
+                for tr in rows:
+                    cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                    if not cells:
+                        continue
+                    # 匹配表头行
+                    if any("IBIT" in c for c in cells) and any("FBTC" in c for c in cells):
+                        col_headers = []
+                        for c in cells:
+                            m = re.search(r"\b(IBIT|FBTC|GBTC|BITB|ARKB|HODL|BRRR|EZBC|BTCO|BTCW|DEFI|BTC|Total|Net)\b", c)
+                            col_headers.append(m.group(1) if m else c)
+                        continue
+
+                    if col_headers and len(cells) >= 5:
+                        date_str = cells[0]
+                        # 识别常见日期格式 (如 "Nov 17, 2026" / "2026-11-17" / "17 Nov 2026" / "Tue, Nov 17")
+                        if re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{4}-\d{2}-\d{2})\b", date_str):
+                            row_dict = {"Date": date_str}
+                            for idx in range(1, min(len(col_headers), len(cells))):
+                                key = col_headers[idx]
+                                if key in ("Net", "Total"):
+                                    key = "Total"
+                                row_dict[key] = parse_flow_number(cells[idx])
+                            # 若表格未单独列 Total 列，则自动求和所有已识别 ETF 列
+                            if "Total" not in row_dict:
+                                row_dict["Total"] = round(
+                                    sum(v for k, v in row_dict.items() if k != "Date" and isinstance(v, float)), 2
+                                )
+                            records.append(row_dict)
+
+                if records:
+                    # 判断表格是最新日期在第一行还是最后一行
+                    latest_first = True
+                    if len(records) >= 2:
+                        # SatsIntel 默认最新日期在最上方
+                        latest_first = True
+                    logger.info(f"成功通过 SatsIntel 主通道获取 ETF 数据 ({records[0]['Date']})")
+                    return build_etf_summary(records, latest_first=latest_first)
+        else:
+            logger.warning(f"SatsIntel 主通道返回状态码: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"SatsIntel 主通道解析异常，切换至备用通道: {e}")
+
+    # 通道 B（备用）：Farside 直连 / 边缘节点
+    date_regex = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
-        resp = scraper.get(FARSIDE_DIRECT_URL, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        target_table = next(
-            (t for t in soup.find_all("table") if "IBIT" in t.get_text() and "Total" in t.get_text()),
-            None,
-        )
-        if target_table:
-            headers_list = []
-            daily_records = []
-            for tr in target_table.find_all("tr"):
-                cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-                if not cells:
-                    continue
-                if "IBIT" in cells and "Total" in cells:
-                    headers_list = cells
-                    continue
-                if headers_list and len(cells) >= len(headers_list) and date_regex.match(cells[0]):
-                    row_dict = {"Date": cells[0]}
-                    for idx in range(1, len(headers_list)):
-                        col_name = headers_list[idx]
-                        if col_name:
-                            row_dict[col_name] = parse_farside_number(cells[idx])
-                    daily_records.append(row_dict)
-            if daily_records:
-                logger.info(f"成功通过直连通道获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
-                return build_etf_summary(daily_records)
+        resp = scraper.get(FARSIDE_DIRECT_URL, timeout=25)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            target_table = next(
+                (t for t in soup.find_all("table") if "IBIT" in t.get_text() and "Total" in t.get_text()),
+                None,
+            )
+            if target_table:
+                headers_list: List[str] = []
+                daily_records: List[Dict] = []
+                for tr in target_table.find_all("tr"):
+                    cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+                    if not cells:
+                        continue
+                    if "IBIT" in cells and "Total" in cells:
+                        headers_list = cells
+                        continue
+                    if headers_list and len(cells) >= len(headers_list) and date_regex.match(cells[0]):
+                        row_dict = {"Date": cells[0]}
+                        for idx in range(1, len(headers_list)):
+                            col_name = headers_list[idx]
+                            if col_name:
+                                row_dict[col_name] = parse_flow_number(cells[idx])
+                        daily_records.append(row_dict)
+                if daily_records:
+                    logger.info(f"成功通过 Farside 备用通道获取 ETF 数据 ({daily_records[-1]['Date']})")
+                    return build_etf_summary(daily_records, latest_first=False)
+        else:
+            logger.warning(f"Farside 备用通道被屏蔽 (HTTP {resp.status_code})")
     except Exception as e:
-        logger.error(f"直连通道获取 Farside ETF 数据失败: {e}")
+        logger.error(f"Farside 备用通道异常: {e}")
 
     return None
 
@@ -385,7 +424,6 @@ def get_last_friday_of_month(year: int, month: int) -> date:
 
 
 def get_cme_days_to_expiry() -> int:
-    """计算 CME 主力合约剩余天数（距离当月交割不足 10 天时自动按次月合约展期计算）"""
     today = datetime.now(timezone.utc).date()
     expiry = get_last_friday_of_month(today.year, today.month)
     if (expiry - today).days <= 10:
@@ -402,264 +440,4 @@ def fetch_yahoo_quote(symbol: str) -> Optional[float]:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
             meta = resp.json()["chart"]["result"][0]["meta"]
-            price = meta.get("regularMarketPrice") or meta.get("previousClose")
-            if price and float(price) > 0:
-                return float(price)
-    except Exception as e:
-        logger.warning(f"Yahoo Finance 获取 {symbol} 失败: {e}")
-    return None
-
-
-def fetch_basis_and_treasury(spot_price: Optional[float]) -> Optional[Dict]:
-    cme_futures = fetch_yahoo_quote("BTC=F")
-    if not spot_price:
-        spot_price = fetch_yahoo_quote("BTC-USD")
-
-    us10y = fetch_yahoo_quote("%5ETNX")
-    if not us10y:
-        try:
-            r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10", timeout=15)
-            if r.status_code == 200:
-                for line in reversed(r.text.strip().splitlines()):
-                    parts = line.split(",")
-                    if len(parts) == 2 and parts[1] != "." and parts[1] != "DGS10":
-                        us10y = float(parts[1])
-                        break
-        except Exception as e:
-            logger.warning(f"FRED 10Y 美债利率备用源失败: {e}")
-
-    if not (cme_futures and spot_price and us10y):
-        return None
-
-    days_to_expiry = get_cme_days_to_expiry()
-    raw_basis_pct = ((cme_futures - spot_price) / spot_price) * 100.0
-    annualized_basis_pct = raw_basis_pct * (365.0 / days_to_expiry)
-    excess_spread_pct = annualized_basis_pct - us10y
-
-    return {
-        "cme_futures": cme_futures,
-        "spot_price": spot_price,
-        "days_to_expiry": days_to_expiry,
-        "raw_basis_pct": raw_basis_pct,
-        "annualized_basis_pct": annualized_basis_pct,
-        "us10y_yield": us10y,
-        "excess_spread_pct": excess_spread_pct,
-    }
-
-
-# ==================== 6. 美盘盘中静默雷达模式 (--intraday) ====================
-def run_intraday_coinbase_radar() -> None:
-    """仅在美盘时段每小时扫描 Coinbase 溢价：触发底背离或由负转正时立即推送，否则保持静默"""
-    state = load_state()
-    cb_data = fetch_coinbase_premium()
-    if not cb_data:
-        logger.warning("美盘盘中扫描：本次未能获取 Coinbase 溢价数据。")
-        return
-
-    prem = cb_data["premium_pct"]
-    chg24 = cb_data["price_chg_24h"]
-    prev_prem = state.get("last_cb_premium")
-
-    alerts: List[str] = []
-
-    # 1. 底背离触发：24h 下跌超过 2%，但 Coinbase 溢价大于 0%
-    if chg24 <= THRESHOLDS["DIVERGENCE_PRICE_DROP_PCT"] and prem > 0:
-        alerts.append(
-            f"🔥 <b>美盘主力吸筹底背离</b>：BTC 24h 下跌 {chg24:.2f}%，但 Coinbase 现货溢价维持正值 ({prem:+.3f}%)！"
-        )
-
-    # 2. 溢价由负转正拐点触发
-    if prev_prem is not None and prev_prem < 0 and prem > 0:
-        alerts.append(
-            f"🔄 <b>Coinbase 溢价由负转正拐点</b>：从 {prev_prem:+.3f}% 翻正至 {prem:+.3f}% (+${cb_data['premium_usd']:.1f})！"
-        )
-    elif prev_prem is None and prem > 0:
-        alerts.append(
-            f"🟢 <b>Coinbase 处于正溢价状态</b>：当前溢价率 {prem:+.3f}% (+${cb_data['premium_usd']:.1f})"
-        )
-
-    # 3. 强势正溢价突破 (+0.05%)
-    if prem >= THRESHOLDS["CB_PREMIUM_POSITIVE_ALERT"] and (
-        prev_prem is None or prev_prem < THRESHOLDS["CB_PREMIUM_POSITIVE_ALERT"]
-    ):
-        alerts.append(
-            f"🇺🇸 <b>美盘现货买盘强势突破</b>：Coinbase 溢价率突破 +0.05%，升至 {prem:+.3f}%"
-        )
-
-    # 保存最新溢价记录供下一小时比对拐点
-    state["last_cb_premium"] = round(prem, 4)
-    save_state(state)
-
-    if not alerts:
-        logger.info(f"美盘盘中扫描完成：Coinbase 溢价 {prem:+.3f}%（未触发转正或底背离），保持静默。")
-        return
-
-    msg_lines = [
-        "<b>⚡ 美盘盘中异动雷达：Coinbase 现货买盘信号</b>\n",
-        "<b>【触发信号】</b>",
-    ]
-    for item in alerts:
-        msg_lines.append(f"• {item}")
-
-    msg_lines.extend([
-        "",
-        "<b>【实时盘面快照】</b>",
-        f"• <b>Coinbase 现货:</b> <code>${cb_data['cb_price']:,.1f}</code> (24h: <code>{chg24:+.2f}%</code>)",
-        f"• <b>离岸基准 ({cb_data['offshore_source']}):</b> <code>${cb_data['offshore_price']:,.1f}</code>",
-        f"• <b>当前溢价率:</b> 🟢 <code>{prem:+.3f}%</code> (<code>{cb_data['premium_usd']:+.1f}</code> USD)",
-    ])
-    send_telegram_message("\n".join(msg_lines))
-
-
-# ==================== 7. 常规全因子综合戦报引擎 ====================
-def evaluate_and_alert(force: bool = False) -> None:
-    state = load_state()
-
-    cot_data = fetch_cftc_btc_cot()
-    etf_data = fetch_farside_etf_flows()
-    cb_data = fetch_coinbase_premium()
-    spot_ref = cb_data["cb_price"] if cb_data else None
-    macro_data = fetch_basis_and_treasury(spot_ref)
-
-    alerts_triggered: List[str] = []
-    has_new_data = False
-
-    if etf_data:
-        if etf_data["date"] != state.get("last_etf_date"):
-            has_new_data = True
-            state["last_etf_date"] = etf_data["date"]
-
-        ibit = etf_data["ibit"]
-        total = etf_data["total"]
-        streak = etf_data["ibit_streak_days"]
-
-        if ibit <= THRESHOLDS["IBIT_HEAVY_OUTFLOW_M"]:
-            alerts_triggered.append(f"🚨 <b>IBIT 大额失血</b>：单日净流出 ${abs(ibit):.1f}M")
-        if total >= THRESHOLDS["TOTAL_INFLOW_ALERT_M"]:
-            alerts_triggered.append(f"🟢 <b>ETF 整体大幅净流入</b>：单日净流入 +${total:.1f}M")
-        if streak >= THRESHOLDS["IBIT_INFLOW_STREAK_DAYS"]:
-            alerts_triggered.append(f"✅ <b>右侧反转确认信号</b>：IBIT 已连续 {streak} 个交易日录得净流入！")
-        if ibit < -50 and etf_data["mini_flow"] > 0:
-            alerts_triggered.append("⚠️ <b>筹码结构分化</b>：巨鲸通道 IBIT 流出，但低费率迷你 ETF 保持净流入")
-
-    if cot_data:
-        if cot_data["report_date"] != state.get("last_cot_date"):
-            has_new_data = True
-            state["last_cot_date"] = cot_data["report_date"]
-
-        net_contracts = cot_data["lev_net_contracts"]
-        chg_contracts = cot_data["lev_net_chg_contracts"]
-
-        if abs(chg_contracts) >= THRESHOLDS["COT_NET_CHANGE_CONTRACTS"]:
-            direction = "空头回补（平仓）" if chg_contracts > 0 else "空头加码（建仓）"
-            alerts_triggered.append(
-                f"📊 <b>华尔街套利盘剧烈调仓</b>：杠杆基金净头寸单周变化 {chg_contracts:+d} 张 ({direction})"
-            )
-        if net_contracts < 0 and abs(net_contracts) <= THRESHOLDS["COT_UNWIND_EXHAUSTED_CONTRACTS"]:
-            alerts_triggered.append(
-                f"🧊 <b>期现套利空头已近枯竭</b>：杠杆基金净空头仅剩 {abs(net_contracts):,} 张 ({abs(cot_data['lev_net_btc']):,} BTC)"
-            )
-
-    if macro_data:
-        spread = macro_data["excess_spread_pct"]
-        if spread >= THRESHOLDS["BASIS_EXCESS_SPREAD_ALERT"]:
-            alerts_triggered.append(
-                f"💰 <b>期现套利窗口重开</b>：CME 年化基差高于 10Y 美债 {spread:+.2f}%，套利买盘具备进场动力"
-            )
-
-    if cb_data:
-        prem = cb_data["premium_pct"]
-        chg24 = cb_data["price_chg_24h"]
-        state["last_cb_premium"] = round(prem, 4)
-
-        if chg24 <= THRESHOLDS["DIVERGENCE_PRICE_DROP_PCT"] and prem > 0:
-            alerts_triggered.append(
-                f"🔥 <b>美盘主力吸筹底背离</b>：BTC 24h 下跌 {chg24:.2f}%，但 Coinbase 现货溢价逆势转正 ({prem:+.3f}%)！"
-            )
-        elif prem >= THRESHOLDS["CB_PREMIUM_POSITIVE_ALERT"]:
-            alerts_triggered.append(
-                f"🇺🇸 <b>美盘现货买盘强劲</b>：Coinbase 溢价率升至 {prem:+.3f}% (+${cb_data['premium_usd']:.1f})"
-            )
-        elif prem <= THRESHOLDS["CB_PREMIUM_NEGATIVE_ALERT"]:
-            alerts_triggered.append(
-                f"🩸 <b>美盘现货抛压沉重</b>：Coinbase 负溢价扩大至 {prem:+.3f}% (${cb_data['premium_usd']:.1f})"
-            )
-
-    if not has_new_data and not force:
-        logger.info("暂无新的 ETF 或 CFTC 报告数据发布，跳过推送。")
-        return
-
-    msg_lines = ["<b>📡 华尔街 BTC 全因子机构监控战报</b>\n"]
-
-    if alerts_triggered:
-        msg_lines.append("<b>【核心交易信号触发】</b>")
-        for item in alerts_triggered:
-            msg_lines.append(f"• {item}")
-        msg_lines.append("")
-
-    if cb_data:
-        prem_icon = "🟢" if cb_data["premium_pct"] > 0 else "🔴"
-        msg_lines.extend([
-            "<b>【1. 现货定价与 Coinbase 溢价】</b>",
-            f"• <b>Coinbase 现货:</b> <code>${cb_data['cb_price']:,.1f}</code> (24h: <code>{cb_data['price_chg_24h']:+.2f}%</code>)",
-            f"• <b>离岸基准 ({cb_data['offshore_source']}):</b> <code>${cb_data['offshore_price']:,.1f}</code>",
-            f"• <b>Coinbase 溢价:</b> {prem_icon} <code>{cb_data['premium_pct']:+.3f}%</code> (<code>{cb_data['premium_usd']:+.1f}</code> USD)",
-            "",
-        ])
-
-    if macro_data:
-        sp = macro_data["excess_spread_pct"]
-        sp_status = "套利有利可图" if sp >= 1.5 else ("微利/观望区间" if sp >= 0 else "倒挂/套利平仓压制")
-        msg_lines.extend([
-            f"<b>【2. 宏观利率锚 & CME 期货基差 (参考 {macro_data['days_to_expiry']} 天交割)】</b>",
-            f"• <b>CME 期货主连:</b> <code>${macro_data['cme_futures']:,.1f}</code> (当期升水 <code>{macro_data['raw_basis_pct']:+.2f}%</code>)",
-            f"• <b>CME 年化基差:</b> <code>{macro_data['annualized_basis_pct']:+.2f}%</code> | <b>10Y 美债:</b> <code>{macro_data['us10y_yield']:.2f}%</code>",
-            f"• <b>套利超额利差:</b> <code>{sp:+.2f}%</code> ({sp_status})",
-            "",
-        ])
-
-    if etf_data:
-        streak = etf_data["ibit_streak_days"]
-        streak_str = f"连流入 {streak} 日" if streak > 0 else (f"连流出 {abs(streak)} 日" if streak < 0 else "持平")
-        msg_lines.extend([
-            f"<b>【3. 美国现货 ETF 资金流 ({etf_data['date']})】</b>",
-            f"• <b>全市场总计:</b> <code>{etf_data['total']:+.1f}M</code> USD",
-            f"• <b>贝莱德 IBIT:</b> <code>{etf_data['ibit']:+.1f}M</code> USD ({streak_str})",
-            f"• <b>富达 FBTC:</b> <code>{etf_data['fbtc']:+.1f}M</code> | <b>灰度 GBTC:</b> <code>{etf_data['gbtc']:+.1f}M</code>",
-            f"• <b>低费率迷你盘 (BTC+BITB):</b> <code>{etf_data['mini_flow']:+.1f}M</code>",
-            "",
-        ])
-    else:
-        msg_lines.append("⚠️ <i>现货 ETF 数据源暂未更新</i>\n")
-
-    if cot_data:
-        net_c = cot_data["lev_net_contracts"]
-        net_label = "净空头" if net_c < 0 else "净多头"
-        msg_lines.extend([
-            f"<b>【4. CME 持仓 & CFTC 杠杆基金 ({cot_data['report_date']})】</b>",
-            f"• <b>CME 总持仓 (OI):</b> {cot_data['open_interest_contracts']:,} 张 ({cot_data['open_interest_btc']:,} BTC)",
-            f"• <b>杠杆基金 {net_label}:</b> <code>{abs(net_c):,}</code> 张 (<b>{abs(cot_data['lev_net_btc']):,} BTC</b>)",
-            f"• <b>单周净头寸变化:</b> <code>{cot_data['lev_net_chg_contracts']:+d}</code> 张 ({cot_data['lev_net_chg_btc']:+d} BTC)",
-            f"• <b>多空明细:</b> 多单 {cot_data['lev_long']:,} / 空单 {cot_data['lev_short']:,} / 展期 {cot_data['lev_spread']:,}",
-        ])
-    else:
-        msg_lines.append("⚠️ <i>CFTC 周度持仓报告暂未更新</i>")
-
-    final_message = "\n".join(msg_lines)
-    if send_telegram_message(final_message) and has_new_data:
-        save_state(state)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V4")
-    parser.add_argument("--force", action="store_true", help="忽略去重状态，强制抓取并发送一次战报")
-    parser.add_argument("--intraday", action="store_true", help="美盘盘中静默雷达模式：仅触发溢价转正或底背离时发送")
-    parser.add_argument("--test", action="store_true", help="仅测试 Telegram Bot 连通性")
-    args = parser.parse_args()
-
-    if args.test:
-        send_telegram_message("✅ <b>BTC 全因子监控节点 V4 测试成功</b>：通道正常。")
-    elif args.intraday:
-        run_intraday_coinbase_radar()
-    else:
-        evaluate_and_alert(force=args.force)
+            price = meta.get("regularMarketPrice

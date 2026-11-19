@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V5 精简稳定版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V6 完整修复版)
 """
 
 import os
@@ -112,7 +112,7 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块 ====================
+# ==================== 3. 美国现货 ETF 资金流模块（已修复总计求和与日期） ====================
 def parse_num(val: str) -> float:
     s = val.strip().replace(",", "").replace("$", "").replace("M", "").replace("m", "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
@@ -128,36 +128,61 @@ def parse_num(val: str) -> float:
 
 def fetch_etf_flows() -> Optional[Dict]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    # 主通道：SatsIntel SSR 页面（适配云端机房 IP，解析 Daily net flow 与 Flows by ETF 双表）
+    # 主通道：SatsIntel SSR 页面
     try:
         resp = requests.get(ETF_SATSINTEL_URL, headers=headers, timeout=25)
         if resp.status_code == 200 and "IBIT" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
             latest_date = ""
             total_flow = 0.0
+            has_explicit_total = False
             fund_flows: Dict[str, float] = {}
 
             for table in soup.find_all("table"):
-                t_text = table.get_text()
+                t_lower = table.get_text().lower()
                 rows = table.find_all("tr")
-                if "Net flow" in t_text and len(rows) > 1:
-                    first_data = [c.get_text(" ", strip=True) for c in rows[1].find_all(["th", "td"])]
-                    if len(first_data) >= 2:
-                        latest_date = first_data[0]
-                        total_flow = parse_num(first_data[1])
-                elif "Latest day" in t_text and "IBIT" in t_text:
+                if len(rows) <= 1:
+                    continue
+
+                # 匹配每日总净流入历史表（忽略大小写）
+                if "date" in t_lower and "flow" in t_lower and "ibit" not in t_lower:
+                    for tr in rows[1:]:
+                        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                        if len(cells) >= 2 and re.search(r"\d", cells[0]):
+                            latest_date = cells[0]
+                            total_flow = parse_num(cells[1])
+                            has_explicit_total = True
+                            break
+
+                # 匹配按单只 ETF 拆分的资金流表
+                elif "ibit" in t_lower and ("latest" in t_lower or "flow" in t_lower or "fbtc" in t_lower):
                     for tr in rows[1:]:
                         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
                         if len(cells) >= 2:
                             ticker = cells[0].split()[0].upper()
-                            fund_flows[ticker] = parse_num(cells[1])
+                            val = parse_num(cells[1])
+                            if ticker in ("TOTAL", "NET", "ALL"):
+                                total_flow = val
+                                has_explicit_total = True
+                            elif re.match(r"^[A-Z]{2,5}$", ticker):
+                                fund_flows[ticker] = val
 
             if fund_flows and "IBIT" in fund_flows:
-                if not latest_date:
-                    m = re.search(r"latest\s*\(([^)]+)\)", soup.get_text(), re.IGNORECASE)
-                    latest_date = m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                # 若未直接抓到汇总列，自动对所有单只 ETF 求和
+                if not has_explicit_total:
+                    total_flow = round(sum(fund_flows.values()), 2)
+
+                # 确保日期包含具体的“日”数字（避免误抓仅含年月的历史注脚如 November 2025）
+                if not latest_date or not re.search(r"\b\d{1,2}\b", latest_date):
+                    date_match = re.search(
+                        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+202\d\b|\b202\d-\d{2}-\d{2}\b",
+                        soup.get_text(),
+                        re.IGNORECASE,
+                    )
+                    latest_date = date_match.group(0) if date_match else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
                 mini = round(fund_flows.get("BTC", 0.0) + fund_flows.get("BITB", 0.0), 2)
-                logger.info(f"成功通过 SatsIntel 获取 ETF 数据 ({latest_date})")
+                logger.info(f"成功通过 SatsIntel 获取 ETF 数据 ({latest_date}), Total={total_flow:+.1f}M")
                 return {
                     "date": latest_date,
                     "ibit": fund_flows.get("IBIT", 0.0),
@@ -404,14 +429,14 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V5")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V6")
     parser.add_argument("--force", action="store_true", help="强制推送战报")
     parser.add_argument("--intraday", action="store_true", help="美盘盘中静默雷达")
     parser.add_argument("--test", action="store_true", help="测试 Telegram 连通性")
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V5 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V6 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     else:

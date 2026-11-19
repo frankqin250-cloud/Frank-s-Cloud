@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V6 完整修复版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V7 双雷达高敏版)
 """
 
 import os
@@ -56,7 +56,7 @@ def load_state() -> Dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"last_cot_date": "", "last_etf_date": "", "last_cb_premium": None}
+    return {"last_cot_date": "", "last_etf_date": "", "last_cb_premium": None, "last_cme_basis": None}
 
 
 def save_state(state: Dict) -> None:
@@ -112,7 +112,7 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块（已修复总计求和与日期） ====================
+# ==================== 3. 美国现货 ETF 资金流模块 ====================
 def parse_num(val: str) -> float:
     s = val.strip().replace(",", "").replace("$", "").replace("M", "").replace("m", "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
@@ -128,7 +128,6 @@ def parse_num(val: str) -> float:
 
 def fetch_etf_flows() -> Optional[Dict]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    # 主通道：SatsIntel SSR 页面
     try:
         resp = requests.get(ETF_SATSINTEL_URL, headers=headers, timeout=25)
         if resp.status_code == 200 and "IBIT" in resp.text:
@@ -143,8 +142,6 @@ def fetch_etf_flows() -> Optional[Dict]:
                 rows = table.find_all("tr")
                 if len(rows) <= 1:
                     continue
-
-                # 匹配每日总净流入历史表（忽略大小写）
                 if "date" in t_lower and "flow" in t_lower and "ibit" not in t_lower:
                     for tr in rows[1:]:
                         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
@@ -153,8 +150,6 @@ def fetch_etf_flows() -> Optional[Dict]:
                             total_flow = parse_num(cells[1])
                             has_explicit_total = True
                             break
-
-                # 匹配按单只 ETF 拆分的资金流表
                 elif "ibit" in t_lower and ("latest" in t_lower or "flow" in t_lower or "fbtc" in t_lower):
                     for tr in rows[1:]:
                         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
@@ -168,11 +163,8 @@ def fetch_etf_flows() -> Optional[Dict]:
                                 fund_flows[ticker] = val
 
             if fund_flows and "IBIT" in fund_flows:
-                # 若未直接抓到汇总列，自动对所有单只 ETF 求和
                 if not has_explicit_total:
                     total_flow = round(sum(fund_flows.values()), 2)
-
-                # 确保日期包含具体的“日”数字（避免误抓仅含年月的历史注脚如 November 2025）
                 if not latest_date or not re.search(r"\b\d{1,2}\b", latest_date):
                     date_match = re.search(
                         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+202\d\b|\b202\d-\d{2}-\d{2}\b",
@@ -182,7 +174,6 @@ def fetch_etf_flows() -> Optional[Dict]:
                     latest_date = date_match.group(0) if date_match else datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
                 mini = round(fund_flows.get("BTC", 0.0) + fund_flows.get("BITB", 0.0), 2)
-                logger.info(f"成功通过 SatsIntel 获取 ETF 数据 ({latest_date}), Total={total_flow:+.1f}M")
                 return {
                     "date": latest_date,
                     "ibit": fund_flows.get("IBIT", 0.0),
@@ -190,12 +181,10 @@ def fetch_etf_flows() -> Optional[Dict]:
                     "gbtc": fund_flows.get("GBTC", 0.0),
                     "mini_flow": mini,
                     "total": total_flow,
-                    "ibit_streak_days": 1 if fund_flows.get("IBIT", 0.0) > 0 else (-1 if fund_flows.get("IBIT", 0.0) < 0 else 0),
                 }
     except Exception as e:
         logger.warning(f"SatsIntel 主通道异常: {e}")
 
-    # 备用通道：Farside 直连
     try:
         scraper = cloudscraper.create_scraper()
         resp = scraper.get(FARSIDE_DIRECT_URL, timeout=20)
@@ -223,7 +212,6 @@ def fetch_etf_flows() -> Optional[Dict]:
                         "gbtc": last.get("GBTC", 0.0),
                         "mini_flow": round(last.get("BTC", 0.0) + last.get("BITB", 0.0), 2),
                         "total": last.get("Total", 0.0),
-                        "ibit_streak_days": 1 if last.get("IBIT", 0.0) > 0 else -1,
                     }
     except Exception as e:
         logger.warning(f"Farside 备用通道异常: {e}")
@@ -308,6 +296,7 @@ def fetch_basis_and_treasury(spot_price: Optional[float]) -> Optional[Dict]:
     ann_basis = raw_basis * (365.0 / days)
     return {
         "cme_futures": cme,
+        "spot_price": spot,
         "days_to_expiry": days,
         "raw_basis_pct": raw_basis,
         "annualized_basis_pct": ann_basis,
@@ -316,8 +305,9 @@ def fetch_basis_and_treasury(spot_price: Optional[float]) -> Optional[Dict]:
     }
 
 
-# ==================== 5. 盘中雷达与主战报调度 ====================
+# ==================== 5. 两大高频静默雷达 (--intraday & --basis) ====================
 def run_intraday_coinbase_radar() -> None:
+    """美盘时段每 10 分钟扫描 Coinbase 溢价：仅触发由负转正或吸筹底背离时推送"""
     state = load_state()
     cb = fetch_coinbase_premium()
     if not cb:
@@ -334,7 +324,7 @@ def run_intraday_coinbase_radar() -> None:
     state["last_cb_premium"] = round(prem, 4)
     save_state(state)
     if not alerts:
-        logger.info(f"盘中扫描静默：Coinbase 溢价 {prem:+.3f}%")
+        logger.info(f"美盘 10m 雷达静默：Coinbase 溢价 {prem:+.3f}%")
         return
 
     lines = ["<b>⚡ 美盘盘中异动雷达：Coinbase 现货买盘信号</b>\n"] + [f"• {a}" for a in alerts]
@@ -343,6 +333,44 @@ def run_intraday_coinbase_radar() -> None:
     send_telegram_message("\n".join(lines))
 
 
+def run_cme_basis_radar() -> None:
+    """每 30 分钟扫描 CME 期货基差：监测是否结束贴水（由负转正）"""
+    state = load_state()
+    cb = fetch_coinbase_premium()
+    macro = fetch_basis_and_treasury(cb["cb_price"] if cb else None)
+    if not macro:
+        return
+
+    curr_basis = macro["raw_basis_pct"]
+    ann_basis = macro["annualized_basis_pct"]
+    prev_basis = state.get("last_cme_basis")
+    alerts = []
+
+    if prev_basis is not None and prev_basis < 0 and curr_basis > 0:
+        alerts.append(
+            f"🔄 <b>CME 期货结束贴水（由负转正）</b>：当期升水从 {prev_basis:+.2f}% 翻正至 {curr_basis:+.2f}%（年化 {ann_basis:+.2f}%），期货做空动能撤退！"
+        )
+    if macro["excess_spread_pct"] >= THRESHOLDS["BASIS_EXCESS_SPREAD_ALERT"] and (prev_basis is None or prev_basis <= 0.1):
+        alerts.append(
+            f"💰 <b>期现套利窗口重开</b>：CME 年化基差高于 10Y 美债 {macro['excess_spread_pct']:+.2f}%，套利买盘具备进场动力！"
+        )
+
+    state["last_cme_basis"] = round(curr_basis, 4)
+    save_state(state)
+    if not alerts:
+        logger.info(f"CME 30m 基差雷达静默：当期基差 {curr_basis:+.2f}% (年化 {ann_basis:+.2f}%)")
+        return
+
+    lines = ["<b>📈 CME 期货基差异动雷达：结构性转强信号</b>\n"] + [f"• {a}" for a in alerts]
+    lines.extend([
+        "",
+        f"• <b>CME 期货主连:</b> <code>${macro['cme_futures']:,.1f}</code> | <b>现货基准:</b> <code>${macro['spot_price']:,.1f}</code>",
+        f"• <b>当期基差:</b> 🟢 <code>{curr_basis:+.2f}%</code> | <b>年化基差:</b> <code>{ann_basis:+.2f}%</code> (10Y 美债: <code>{macro['us10y_yield']:.2f}%</code>)",
+    ])
+    send_telegram_message("\n".join(lines))
+
+
+# ==================== 6. 常规全因子综合战报引擎 ====================
 def evaluate_and_alert(force: bool = False) -> None:
     state = load_state()
     cot = fetch_cftc_btc_cot()
@@ -371,6 +399,13 @@ def evaluate_and_alert(force: bool = False) -> None:
             alerts.append(f"📊 <b>华尔街套利盘调仓</b>：杠杆基金净头寸变化 {cot['lev_net_chg_contracts']:+d} 张 ({d_str})")
         if cot["lev_net_contracts"] < 0 and abs(cot["lev_net_contracts"]) <= THRESHOLDS["COT_UNWIND_EXHAUSTED_CONTRACTS"]:
             alerts.append(f"🧊 <b>期现套利空头已近枯竭</b>：杠杆基金净空头仅剩 {abs(cot['lev_net_contracts']):,} 张 ({abs(cot['lev_net_btc']):,} BTC)")
+
+    if macro:
+        prev_b = state.get("last_cme_basis")
+        curr_b = macro["raw_basis_pct"]
+        state["last_cme_basis"] = round(curr_b, 4)
+        if prev_b is not None and prev_b < 0 and curr_b > 0:
+            alerts.append(f"🔄 <b>CME 期货结束贴水</b>：基差从 {prev_b:+.2f}% 翻正至 {curr_b:+.2f}%")
 
     if cb:
         prem, chg24 = cb["premium_pct"], cb["price_chg_24h"]
@@ -424,20 +459,23 @@ def evaluate_and_alert(force: bool = False) -> None:
             f"• <b>多空明细:</b> 多单 {cot['lev_long']:,} / 空单 {cot['lev_short']:,} / 展期 {cot['lev_spread']:,}",
         ])
 
-    if send_telegram_message("\n".join(msg)) and has_new:
+    if send_telegram_message("\n".join(msg)):
         save_state(state)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V6")
-    parser.add_argument("--force", action="store_true", help="强制推送战报")
-    parser.add_argument("--intraday", action="store_true", help="美盘盘中静默雷达")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V7")
+    parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
+    parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
+    parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
     parser.add_argument("--test", action="store_true", help="测试 Telegram 连通性")
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V6 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V7 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
+    elif args.basis:
+        run_cme_basis_radar()
     else:
         evaluate_and_alert(force=args.force)

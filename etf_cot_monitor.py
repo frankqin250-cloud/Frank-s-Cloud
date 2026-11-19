@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CME CFTC 杠杆基金净空头 & 美国现货 BTC ETF 资金流监控告警脚本 (V2 云端防屏蔽版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V3 完整版)
+覆盖四大核心维度:
+  1. 美国现货 BTC ETF 每日资金流 (Farside 防屏蔽通道 + 直连备用)
+  2. CME 期货持仓 & CFTC 杠杆基金净空头 (CFTC 官方 JSON API + 网页备用)
+  3. CME 期货年化基差 vs 美国 10 年期国债收益率 (套利超额利差测算)
+  4. Coinbase 现货溢价指数 & 美盘主力吸筹底背离雷达
 """
 
 import os
 import re
 import sys
 import json
+import calendar
 import logging
 import argparse
+from datetime import datetime, date, timezone
 from typing import Dict, List, Optional
 
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 
-# ==================== 配置区 ====================
+# ==================== 1. 环境变量与阈值配置区 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
-# CFTC 官方开放数据 API (TFF 金融期货持仓报告) & 网页备用源
+# 数据源接口地址
 CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 CFTC_HTML_URL = "https://www.cftc.gov/dea/futures/financial_lf.htm"
-
-# Farside ETF 边缘防屏蔽源 & 直连备用源
 FARSIDE_JINA_URL = "https://r.jina.ai/https://farside.co.uk/btc/"
 FARSIDE_DIRECT_URL = "https://farside.co.uk/btc/"
 
+# 核心告警阈值配置（可根据你的交易节奏微调）
 THRESHOLDS = {
-    "IBIT_HEAVY_OUTFLOW_M": -150.0,        # IBIT 单日净流出警报阈值（百万美元）
-    "TOTAL_INFLOW_ALERT_M": 100.0,         # 全市场 ETF 单日净流入警报阈值（百万美元）
-    "IBIT_INFLOW_STREAK_DAYS": 2,          # IBIT 连续净流入右侧反转天数阈值
-    "COT_NET_CHANGE_CONTRACTS": 1000,      # CFTC 杠杆基金单周调仓张数阈值
-    "COT_UNWIND_EXHAUSTED_CONTRACTS": 3000 # CFTC 杠杆基金套利空头枯竭阈值
+    "IBIT_HEAVY_OUTFLOW_M": -150.0,         # IBIT 单日净流出超过 1.5 亿美元触发大额失血警报
+    "TOTAL_INFLOW_ALERT_M": 100.0,          # 全市场 ETF 单日净流入超过 1 亿美元触发回流警报
+    "IBIT_INFLOW_STREAK_DAYS": 2,           # IBIT 连续净流入达到 2 天触发右侧反转信号
+    "COT_NET_CHANGE_CONTRACTS": 1000,       # CFTC 杠杆基金单周调仓超过 1000 张触发警报
+    "COT_UNWIND_EXHAUSTED_CONTRACTS": 3000, # CFTC 杠杆基金净空头低于 3000 张提示套利出清尾声
+    "BASIS_EXCESS_SPREAD_ALERT": 2.0,       # CME 年化基差高于 10Y 美债 2% 以上提示套利资金回归
+    "CB_PREMIUM_POSITIVE_ALERT": 0.05,      # Coinbase 溢价率高于 +0.05% 触发美盘强买盘信号
+    "CB_PREMIUM_NEGATIVE_ALERT": -0.08,     # Coinbase 溢价率低于 -0.08% 触发美盘抛压警报
+    "DIVERGENCE_PRICE_DROP_PCT": -2.0,      # 24h 跌幅超过 2% 且溢价转正时，触发主力吸筹底背离
 }
 
 logging.basicConfig(
@@ -47,7 +57,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-logger = logging.getLogger("ETF_COT_Monitor")
+logger = logging.getLogger("BTC_Institutional_Monitor")
 
 
 def load_state() -> Dict:
@@ -85,24 +95,23 @@ def send_telegram_message(text: str) -> bool:
         if resp.status_code != 200:
             logger.error(f"Telegram API 返回错误 ({resp.status_code}): {resp.text}")
             return False
-        logger.info("Telegram 告警推送成功。")
+        logger.info("Telegram 战报推送成功。")
         return True
     except Exception as e:
         logger.error(f"Telegram 网络请求失败: {e}")
         return False
 
 
-# ==================== 1. CFTC COT 解析模块（双源保障） ====================
+# ==================== 2. CFTC COT 持仓解析模块 ====================
 def fetch_cftc_btc_cot() -> Optional[Dict]:
-    # 通道 A：优先请求 CFTC 官方结构化 JSON API（最稳定，不受网页排版影响）
+    # 通道 A：CFTC 官方结构化 JSON API
     try:
         params = {
             "cftc_contract_market_code": "133741",
             "$order": "report_date_as_yyyy_mm_dd DESC",
             "$limit": 2,
         }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(CFTC_API_URL, params=params, headers=headers, timeout=20)
+        resp = requests.get(CFTC_API_URL, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         if resp.status_code == 200:
             data = resp.json()
             if data and len(data) > 0:
@@ -134,24 +143,20 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     except Exception as e:
         logger.warning(f"CFTC 官方 API 请求异常，切换至网页备用解析: {e}")
 
-    # 通道 B：CFTC 网页备用解析（兼容 CFTC Code # 133741 空格格式）
+    # 通道 B：CFTC 网页备用解析
     try:
         resp = requests.get(CFTC_HTML_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         resp.raise_for_status()
-        raw_text = resp.text
-
         pattern = re.compile(
             r"BITCOIN\s*-\s*CHICAGO MERCANTILE EXCHANGE.*?133741.*?(?=CFTC Code #|\Z)",
             re.DOTALL | re.IGNORECASE,
         )
-        match = pattern.search(raw_text)
+        match = pattern.search(resp.text)
         if not match:
-            logger.error("CFTC 备用网页仍未匹配到 133741 区块。")
+            logger.error("CFTC 备用网页未匹配到 133741 区块。")
             return None
 
-        block = match.group(0)
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-
+        lines = [line.strip() for line in match.group(0).splitlines() if line.strip()]
         report_date = "Unknown"
         open_interest = 0
         pos_nums: List[int] = []
@@ -176,7 +181,6 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
                     chg_nums = nums
 
         if len(pos_nums) < 14:
-            logger.error("CFTC 网页持仓数字列不完整。")
             return None
 
         lev_long, lev_short, lev_spread = pos_nums[6], pos_nums[7], pos_nums[8]
@@ -200,7 +204,7 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
         return None
 
 
-# ==================== 2. 现货 ETF 资金流解析模块（防 403 双通道） ====================
+# ==================== 3. 美国现货 ETF 资金流模块 ====================
 def parse_farside_number(val: str) -> float:
     s = val.strip().replace(",", "").replace("$", "")
     if not s or s == "-" or s.lower() == "n/a":
@@ -245,7 +249,7 @@ def build_etf_summary(daily_records: List[Dict]) -> Dict:
 def fetch_farside_etf_flows() -> Optional[Dict]:
     date_regex = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
 
-    # 通道 A：通过边缘阅读节点抓取（解决 GitHub Actions 云服务器 IP 被 Cloudflare 403 拦截问题）
+    # 通道 A：边缘防屏蔽节点
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -255,7 +259,6 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
         if resp.status_code == 200 and "IBIT" in resp.text:
             headers_list: List[str] = []
             daily_records: List[Dict] = []
-
             for line in resp.text.splitlines():
                 if "|" not in line:
                     continue
@@ -270,14 +273,13 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
                     for idx in range(1, len(headers_list)):
                         row_dict[headers_list[idx]] = parse_farside_number(cells[idx])
                     daily_records.append(row_dict)
-
             if daily_records:
                 logger.info(f"成功通过边缘防屏蔽节点获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
                 return build_etf_summary(daily_records)
     except Exception as e:
         logger.warning(f"边缘节点获取 ETF 数据异常，尝试直连备用通道: {e}")
 
-    # 通道 B：直连 Farside HTML 表格（适合本地电脑运行）
+    # 通道 B：直连 Farside 表格
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -285,13 +287,10 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
         resp = scraper.get(FARSIDE_DIRECT_URL, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        target_table = None
-        for table in soup.find_all("table"):
-            if "IBIT" in table.get_text() and "Total" in table.get_text():
-                target_table = table
-                break
-
+        target_table = next(
+            (t for t in soup.find_all("table") if "IBIT" in t.get_text() and "Total" in t.get_text()),
+            None,
+        )
         if target_table:
             headers_list = []
             daily_records = []
@@ -307,7 +306,6 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
                     for idx in range(1, len(headers_list)):
                         row_dict[headers_list[idx]] = parse_farside_number(cells[idx])
                     daily_records.append(row_dict)
-
             if daily_records:
                 logger.info(f"成功通过直连通道获取 Farside ETF 数据 ({daily_records[-1]['Date']})")
                 return build_etf_summary(daily_records)
@@ -317,15 +315,167 @@ def fetch_farside_etf_flows() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 告警规则评估与消息组装 ====================
+# ==================== 4. Coinbase 现货溢价指数模块 ====================
+def fetch_coinbase_premium() -> Optional[Dict]:
+    """
+    计算 Coinbase BTC-USD 相对离岸主力 BTC-USDT 的实时现货溢价率
+    并获取 24 小时涨跌幅用于识别“价格跌但溢价转正”的主力吸筹底背离
+    """
+    cb_price = None
+    price_chg_24h = 0.0
+    offshore_price = None
+    offshore_source = ""
+
+    # 1. 获取 Coinbase 实时价格与 24h 涨跌幅
+    try:
+        resp = requests.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/stats",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            stats = resp.json()
+            cb_price = float(stats["last"])
+            open_24h = float(stats["open"])
+            if open_24h > 0:
+                price_chg_24h = ((cb_price - open_24h) / open_24h) * 100.0
+    except Exception as e:
+        logger.warning(f"Coinbase 行情获取失败: {e}")
+
+    if not cb_price:
+        return None
+
+    # 2. 获取离岸主流 USDT 现货参考价（按美东服务器连通性优先级依次尝试 OKX -> Bitfinex -> Kraken）
+    offshore_endpoints = [
+        ("OKX", "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", lambda d: float(d["data"][0]["last"])),
+        ("Bitfinex", "https://api-pub.bitfinex.com/v2/ticker/tBTCUST", lambda d: float(d[6])),
+        ("Kraken", "https://api.kraken.com/0/public/Ticker?pair=XBTUSDT", lambda d: float(list(d["result"].values())[0]["c"][0])),
+    ]
+
+    for name, url, parser in offshore_endpoints:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+            if r.status_code == 200:
+                val = parser(r.json())
+                if val > 0:
+                    offshore_price = val
+                    offshore_source = name
+                    break
+        except Exception:
+            continue
+
+    if not offshore_price:
+        logger.error("所有离岸 USDT 现货行情源均请求失败。")
+        return None
+
+    premium_usd = cb_price - offshore_price
+    premium_pct = (premium_usd / offshore_price) * 100.0
+
+    logger.info(f"Coinbase 溢价率计算完成: {premium_pct:+.3f}% (CB: {cb_price:.1f} vs {offshore_source}: {offshore_price:.1f})")
+    return {
+        "cb_price": cb_price,
+        "offshore_price": offshore_price,
+        "offshore_source": offshore_source,
+        "premium_usd": premium_usd,
+        "premium_pct": premium_pct,
+        "price_chg_24h": price_chg_24h,
+    }
+
+
+# ==================== 5. CME 期货年化基差 & 10Y 美债利率模块 ====================
+def get_last_friday_of_month(year: int, month: int) -> date:
+    last_day = calendar.monthrange(year, month)[1]
+    d = date(year, month, last_day)
+    while d.weekday() != calendar.FRIDAY:
+        d = date(year, month, d.day - 1)
+    return d
+
+
+def get_cme_days_to_expiry() -> int:
+    """计算距离 CME 比特币期货主连合约到期日（当月最后一个周五）的剩余天数"""
+    today = datetime.now(timezone.utc).date()
+    expiry = get_last_friday_of_month(today.year, today.month)
+    # 临近到期前 3 天机构已完成展期至下月合约
+    if (expiry - today).days <= 3:
+        next_year = today.year + (1 if today.month == 12 else 0)
+        next_month = 1 if today.month == 12 else today.month + 1
+        expiry = get_last_friday_of_month(next_year, next_month)
+    return max((expiry - today).days, 7)
+
+
+def fetch_yahoo_quote(symbol: str) -> Optional[float]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            meta = resp.json()["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice") or meta.get("previousClose")
+            if price and float(price) > 0:
+                return float(price)
+    except Exception as e:
+        logger.warning(f"Yahoo Finance 获取 {symbol} 失败: {e}")
+    return None
+
+
+def fetch_basis_and_treasury(spot_price: Optional[float]) -> Optional[Dict]:
+    """计算 CME 期货年化基差、10 年期美债收益率及期现套利超额利差"""
+    cme_futures = fetch_yahoo_quote("BTC=F")
+    if not spot_price:
+        spot_price = fetch_yahoo_quote("BTC-USD")
+
+    # 获取美国 10 年期国债收益率（Yahoo ^TNX 优先，美联储 FRED 官方 CSV 备用）
+    us10y = fetch_yahoo_quote("%5ETNX")
+    if not us10y:
+        try:
+            r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10", timeout=15)
+            if r.status_code == 200:
+                for line in reversed(r.text.strip().splitlines()):
+                    parts = line.split(",")
+                    if len(parts) == 2 and parts[1] != "." and parts[1] != "DGS10":
+                        us10y = float(parts[1])
+                        break
+        except Exception as e:
+            logger.warning(f"FRED 10Y 美债利率备用源失败: {e}")
+
+    if not (cme_futures and spot_price and us10y):
+        logger.warning(f"基差与美债数据不完整 (CME={cme_futures}, Spot={spot_price}, US10Y={us10y})")
+        return None
+
+    days_to_expiry = get_cme_days_to_expiry()
+    raw_basis_pct = ((cme_futures - spot_price) / spot_price) * 100.0
+    annualized_basis_pct = raw_basis_pct * (365.0 / days_to_expiry)
+    excess_spread_pct = annualized_basis_pct - us10y
+
+    logger.info(
+        f"CME 基差测算完成: Futures={cme_futures:.1f}, Spot={spot_price:.1f}, "
+        f"年化基差={annualized_basis_pct:.2f}%, 10Y美债={us10y:.2f}%, 超额利差={excess_spread_pct:+.2f}%"
+    )
+    return {
+        "cme_futures": cme_futures,
+        "spot_price": spot_price,
+        "days_to_expiry": days_to_expiry,
+        "raw_basis_pct": raw_basis_pct,
+        "annualized_basis_pct": annualized_basis_pct,
+        "us10y_yield": us10y,
+        "excess_spread_pct": excess_spread_pct,
+    }
+
+
+# ==================== 6. 综合评估与战报推送引擎 ====================
 def evaluate_and_alert(force: bool = False) -> None:
     state = load_state()
+
     cot_data = fetch_cftc_btc_cot()
     etf_data = fetch_farside_etf_flows()
+    cb_data = fetch_coinbase_premium()
+    spot_ref = cb_data["cb_price"] if cb_data else None
+    macro_data = fetch_basis_and_treasury(spot_ref)
 
     alerts_triggered: List[str] = []
     has_new_data = False
 
+    # --- 1. 评估 ETF 资金流告警 ---
     if etf_data:
         if etf_data["date"] != state.get("last_etf_date"):
             has_new_data = True
@@ -340,10 +490,11 @@ def evaluate_and_alert(force: bool = False) -> None:
         if total >= THRESHOLDS["TOTAL_INFLOW_ALERT_M"]:
             alerts_triggered.append(f"🟢 <b>ETF 整体大幅净流入</b>：单日净流入 +${total:.1f}M")
         if streak >= THRESHOLDS["IBIT_INFLOW_STREAK_DAYS"]:
-            alerts_triggered.append(f"✅ <b>右侧反转信号</b>：IBIT 已连续 {streak} 个交易日录得净流入！")
+            alerts_triggered.append(f"✅ <b>右侧反转确认信号</b>：IBIT 已连续 {streak} 个交易日录得净流入！")
         if ibit < -50 and etf_data["mini_flow"] > 0:
             alerts_triggered.append("⚠️ <b>筹码结构分化</b>：巨鲸通道 IBIT 流出，但低费率迷你 ETF 保持净流入")
 
+    # --- 2. 评估 CFTC 持仓告警 ---
     if cot_data:
         if cot_data["report_date"] != state.get("last_cot_date"):
             has_new_data = True
@@ -362,23 +513,75 @@ def evaluate_and_alert(force: bool = False) -> None:
                 f"🧊 <b>期现套利空头已近枯竭</b>：杠杆基金净空头仅剩 {abs(net_contracts):,} 张 ({abs(cot_data['lev_net_btc']):,} BTC)"
             )
 
+    # --- 3. 评估 CME 基差与美债超额利差 ---
+    if macro_data:
+        spread = macro_data["excess_spread_pct"]
+        if spread >= THRESHOLDS["BASIS_EXCESS_SPREAD_ALERT"]:
+            alerts_triggered.append(
+                f"💰 <b>期现套利窗口重开</b>：CME 年化基差高于 10Y 美债 {spread:+.2f}%，套利买盘具备进场动力"
+            )
+
+    # --- 4. 评估 Coinbase 现货溢价与底背离 ---
+    if cb_data:
+        prem = cb_data["premium_pct"]
+        chg24 = cb_data["price_chg_24h"]
+
+        if chg24 <= THRESHOLDS["DIVERGENCE_PRICE_DROP_PCT"] and prem >= THRESHOLDS["CB_PREMIUM_POSITIVE_ALERT"]:
+            alerts_triggered.append(
+                f"🔥 <b>美盘主力吸筹底背离</b>：BTC 24h 下跌 {chg24:.2f}%，但 Coinbase 现货溢价逆势转正 ({prem:+.3f}%)！"
+            )
+        elif prem >= THRESHOLDS["CB_PREMIUM_POSITIVE_ALERT"]:
+            alerts_triggered.append(
+                f"🇺🇸 <b>美盘现货买盘强劲</b>：Coinbase 溢价率升至 {prem:+.3f}% (+${cb_data['premium_usd']:.1f})"
+            )
+        elif prem <= THRESHOLDS["CB_PREMIUM_NEGATIVE_ALERT"]:
+            alerts_triggered.append(
+                f"🩸 <b>美盘现货抛压沉重</b>：Coinbase 负溢价扩大至 {prem:+.3f}% (${cb_data['premium_usd']:.1f})"
+            )
+
+    # 仅在有新数据更新或手动指定 --force 时发送通知
     if not has_new_data and not force:
         logger.info("暂无新的 ETF 或 CFTC 报告数据发布，跳过推送。")
         return
 
-    msg_lines = ["<b>📡 华尔街 BTC 机构资金与衍生品监控战报</b>\n"]
+    # ==================== 组装 Telegram 四维全因子战报 ====================
+    msg_lines = ["<b>📡 华尔街 BTC 全因子机构监控战报</b>\n"]
 
     if alerts_triggered:
-        msg_lines.append("<b>【触发信号】</b>")
+        msg_lines.append("<b>【核心交易信号触发】</b>")
         for item in alerts_triggered:
             msg_lines.append(f"• {item}")
         msg_lines.append("")
 
+    # 模块 1：实时价格与 Coinbase 溢价
+    if cb_data:
+        prem_icon = "🟢" if cb_data["premium_pct"] > 0 else "🔴"
+        msg_lines.extend([
+            "<b>【1. 现货定价与 Coinbase 溢价】</b>",
+            f"• <b>Coinbase 现货:</b> <code>${cb_data['cb_price']:,.1f}</code> (24h: <code>{cb_data['price_chg_24h']:+.2f}%</code>)",
+            f"• <b>离岸基准 ({cb_data['offshore_source']}):</b> <code>${cb_data['offshore_price']:,.1f}</code>",
+            f"• <b>Coinbase 溢价:</b> {prem_icon} <code>{cb_data['premium_pct']:+.3f}%</code> (<code>{cb_data['premium_usd']:+.1f}</code> USD)",
+            "",
+        ])
+
+    # 模块 2：CME 期货基差 vs 10 年期美债
+    if macro_data:
+        sp = macro_data["excess_spread_pct"]
+        sp_status = "套利有利可图" if sp >= 1.5 else ("微利/观望区间" if sp >= 0 else "倒挂/套利平仓压制")
+        msg_lines.extend([
+            f"<b>【2. 宏观利率锚 & CME 期货基差 (剩 {macro_data['days_to_expiry']} 天交割)】</b>",
+            f"• <b>CME 期货主连:</b> <code>${macro_data['cme_futures']:,.1f}</code> (当期升水 <code>{macro_data['raw_basis_pct']:+.2f}%</code>)",
+            f"• <b>CME 年化基差:</b> <code>{macro_data['annualized_basis_pct']:+.2f}%</code> | <b>10Y 美债:</b> <code>{macro_data['us10y_yield']:.2f}%</code>",
+            f"• <b>套利超额利差:</b> <code>{sp:+.2f}%</code> ({sp_status})",
+            "",
+        ])
+
+    # 模块 3：美国现货 ETF 资金流
     if etf_data:
         streak = etf_data["ibit_streak_days"]
         streak_str = f"连流入 {streak} 日" if streak > 0 else (f"连流出 {abs(streak)} 日" if streak < 0 else "持平")
         msg_lines.extend([
-            f"<b>【美国现货 ETF 资金流 ({etf_data['date']})】</b>",
+            f"<b>【3. 美国现货 ETF 资金流 ({etf_data['date']})】</b>",
             f"• <b>全市场总计:</b> <code>{etf_data['total']:+.1f}M</code> USD",
             f"• <b>贝莱德 IBIT:</b> <code>{etf_data['ibit']:+.1f}M</code> USD ({streak_str})",
             f"• <b>富达 FBTC:</b> <code>{etf_data['fbtc']:+.1f}M</code> | <b>灰度 GBTC:</b> <code>{etf_data['gbtc']:+.1f}M</code>",
@@ -386,20 +589,21 @@ def evaluate_and_alert(force: bool = False) -> None:
             "",
         ])
     else:
-        msg_lines.append("⚠️ <i>本次未获取到现货 ETF 数据（数据源可能正在更新中）</i>\n")
+        msg_lines.append("⚠️ <i>现货 ETF 数据源暂未更新</i>\n")
 
+    # 模块 4：CME 期货持仓与 CFTC 杠杆基金净空头
     if cot_data:
         net_c = cot_data["lev_net_contracts"]
         net_label = "净空头" if net_c < 0 else "净多头"
         msg_lines.extend([
-            f"<b>【CME 期货 & CFTC 持仓 ({cot_data['report_date']})】</b>",
+            f"<b>【4. CME 持仓 & CFTC 杠杆基金 ({cot_data['report_date']})】</b>",
             f"• <b>CME 总持仓 (OI):</b> {cot_data['open_interest_contracts']:,} 张 ({cot_data['open_interest_btc']:,} BTC)",
             f"• <b>杠杆基金 {net_label}:</b> <code>{abs(net_c):,}</code> 张 (<b>{abs(cot_data['lev_net_btc']):,} BTC</b>)",
             f"• <b>单周净头寸变化:</b> <code>{cot_data['lev_net_chg_contracts']:+d}</code> 张 ({cot_data['lev_net_chg_btc']:+d} BTC)",
-            f"• <b>多空明细:</b> 多单 {cot_data['lev_long']:,} / 空单 {cot_data['lev_short']:,} / 套利展期 {cot_data['lev_spread']:,}",
+            f"• <b>多空明细:</b> 多单 {cot_data['lev_long']:,} / 空单 {cot_data['lev_short']:,} / 展期 {cot_data['lev_spread']:,}",
         ])
     else:
-        msg_lines.append("⚠️ <i>本次未获取到 CFTC 周度持仓报告</i>")
+        msg_lines.append("⚠️ <i>CFTC 周度持仓报告暂未更新</i>")
 
     final_message = "\n".join(msg_lines)
     if send_telegram_message(final_message) and has_new_data:
@@ -407,12 +611,12 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC ETF & CFTC COT 监控脚本")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V3")
     parser.add_argument("--force", action="store_true", help="忽略去重状态，强制抓取并发送一次战报")
     parser.add_argument("--test", action="store_true", help="仅测试 Telegram Bot 连通性")
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 机构监控节点测试成功</b>：服务器网络与 Telegram Bot 通道正常。")
+        send_telegram_message("✅ <b>BTC 全因子监控节点 V3 测试成功</b>：通道正常。")
     else:
         evaluate_and_alert(force=args.force)

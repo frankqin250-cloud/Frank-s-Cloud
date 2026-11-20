@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V11 SoSoValue OpenAPI v1 诊断增强版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V12 SoSoValue 智能字段自适应版)
 """
 
 import os
@@ -12,7 +12,7 @@ import calendar
 import logging
 import argparse
 from datetime import datetime, date, timezone
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -112,9 +112,9 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块（SoSoValue OpenAPI v1 主源） ====================
-def parse_etf_amount(val) -> Optional[float]:
-    if val is None:
+# ==================== 3. 美国现货 ETF 资金流模块（SoSoValue 智能字段自适应） ====================
+def parse_etf_amount(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
         num = float(val)
@@ -178,25 +178,57 @@ def _build_etf_payload(date_label: str, funds: Dict[str, float], total_val: Opti
     }
 
 
-def _extract_first_valid_flow(obj: Dict) -> Tuple[Optional[float], str]:
-    flow_keys = ("net_inflow", "netInflow", "daily_net_inflow", "dailyNetInflow", "flow", "latest_net_inflow")
-    date_keys = ("date", "trade_date", "tradeDate", "snapshot_date", "time", "updated_at")
-    val = None
-    for k in flow_keys:
-        if k in obj and obj[k] is not None:
-            val = parse_etf_amount(obj[k])
-            if val is not None:
-                break
+def _smart_extract_flow(obj: Dict) -> Tuple[Optional[float], str]:
+    """自适应提取净流入金额与日期，兼容任意命名风格及嵌套字典"""
     d_str = ""
-    for dk in date_keys:
-        if dk in obj and obj[dk]:
-            d_str = str(obj[dk])[:10]
-            break
-    return val, d_str
+    for k, v in obj.items():
+        kl = k.lower()
+        if any(dk in kl for dk in ("date", "time", "day", "dt")) and v:
+            m = re.search(r"202\d-\d{2}-\d{2}", str(v))
+            if m:
+                d_str = m.group(0)
+                break
+
+    # 第一优先级：明确包含 inflow / flow 且非累计值（cum / cumulative）的字段
+    for k, v in obj.items():
+        kl = k.lower()
+        if ("inflow" in kl or "flow" in kl) and not any(ex in kl for ex in ("cum", "status", "type", "rate", "pct", "ratio")):
+            if isinstance(v, dict):
+                sub_val, sub_d = _smart_extract_flow(v)
+                if sub_val is not None:
+                    return sub_val, (sub_d or d_str)
+            else:
+                parsed = parse_etf_amount(v)
+                if parsed is not None:
+                    return parsed, d_str
+
+    # 第二优先级：若存在 value / amount 等通用数值字段（常用于 nested flow 对象内部）
+    for k in ("value", "amount", "usd", "net"):
+        if k in obj and obj[k] is not None and not isinstance(obj[k], (dict, list)):
+            parsed = parse_etf_amount(obj[k])
+            if parsed is not None:
+                return parsed, d_str
+
+    return None, d_str
+
+
+def _unwrap_list(raw: Any) -> List[Dict]:
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, dict):
+        for key in ("data", "list", "records", "items", "rows", "etfs", "result"):
+            sub = raw.get(key)
+            if isinstance(sub, list):
+                return [x for x in sub if isinstance(x, dict)]
+            if isinstance(sub, dict):
+                nested = _unwrap_list(sub)
+                if nested:
+                    return nested
+    return []
 
 
 def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
-    """返回 (payload, 失败诊断原因)"""
+    """主源：SoSoValue OpenAPI v1 批量 ETF 列表 + 汇总历史双重校验"""
     if not SOSOVALUE_API_KEY:
         return None, "未检测到SOSOVALUE_API_KEY"
 
@@ -206,55 +238,72 @@ def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
         "User-Agent": "Mozilla/5.0",
     }
     try:
+        funds: Dict[str, float] = {}
+        latest_date = ""
+        debug_keys = ""
+
+        # 步骤 1：优先调用批量基金列表接口 GET /etfs?symbol=BTC&country_code=US（一次拿全所有 ETF 最新值）
+        list_url = f"{SOSOVALUE_V1_BASE}/etfs"
+        r_list = requests.get(list_url, headers=headers, params={"symbol": "BTC", "country_code": "US"}, timeout=15)
+        if r_list.status_code == 200:
+            etf_items = _unwrap_list(r_list.json())
+            if etf_items:
+                debug_keys = ",".join(list(etf_items[0].keys())[:6])
+            for item in etf_items:
+                tk = str(item.get("ticker") or item.get("symbol") or item.get("code") or "").strip().upper()
+                if not tk:
+                    continue
+                v, d = _smart_extract_flow(item)
+                if v is not None:
+                    funds[tk] = v
+                    if d and d > latest_date:
+                        latest_date = d
+
+        # 步骤 2：调用汇总历史接口 GET /etfs/summary-history 获取官方全市场总净流入（跳过 T+1 空值行）
+        total_val: Optional[float] = None
         sum_url = f"{SOSOVALUE_V1_BASE}/etfs/summary-history"
         r_sum = requests.get(sum_url, headers=headers, params={"symbol": "BTC", "country_code": "US", "limit": 5}, timeout=15)
-        if r_sum.status_code != 200:
-            logger.warning(f"SoSoValue summary-history HTTP {r_sum.status_code}: {r_sum.text[:150]}")
-            return None, f"API HTTP {r_sum.status_code}"
-
-        raw_sum = r_sum.json()
-        rows = raw_sum.get("data") if isinstance(raw_sum, dict) else raw_sum
-        if isinstance(rows, dict):
-            rows = rows.get("list") or rows.get("records") or rows.get("items") or []
-        if not isinstance(rows, list) or not rows:
-            return None, "API返回列表为空"
-
-        total_val: Optional[float] = None
-        latest_date = ""
-        for row in rows:
-            if isinstance(row, dict):
-                v, d = _extract_first_valid_flow(row)
+        if r_sum.status_code == 200:
+            sum_rows = _unwrap_list(r_sum.json())
+            if sum_rows and not debug_keys:
+                debug_keys = ",".join(list(sum_rows[0].keys())[:6])
+            for row in sum_rows:
+                v, d = _smart_extract_flow(row)
                 if v is not None:
                     total_val = v
-                    latest_date = d
+                    if d and d >= latest_date:
+                        latest_date = d
                     break
 
-        if total_val is None:
-            return None, "API净流入字段为空"
+        # 步骤 3：若批量接口未拿到核心单只 ETF，补调 market-snapshot
+        if "IBIT" not in funds:
+            for ticker in ("IBIT", "FBTC", "GBTC", "BTC", "BITB"):
+                snap_url = f"{SOSOVALUE_V1_BASE}/etfs/{ticker}/market-snapshot"
+                r_tk = requests.get(snap_url, headers=headers, timeout=12)
+                if r_tk.status_code == 200:
+                    tk_raw = r_tk.json()
+                    tk_obj = tk_raw.get("data") if isinstance(tk_raw, dict) else tk_raw
+                    if isinstance(tk_obj, list) and tk_obj:
+                        tk_obj = tk_obj[0]
+                    if isinstance(tk_obj, dict):
+                        v, d = _smart_extract_flow(tk_obj)
+                        if v is not None:
+                            funds[ticker] = v
+                            if d and d > latest_date:
+                                latest_date = d
 
-        funds: Dict[str, float] = {}
-        for ticker in ("IBIT", "FBTC", "GBTC", "BTC", "BITB"):
-            snap_url = f"{SOSOVALUE_V1_BASE}/etfs/{ticker}/market-snapshot"
-            r_tk = requests.get(snap_url, headers=headers, timeout=12)
-            if r_tk.status_code == 200:
-                tk_json = r_tk.json()
-                tk_data = tk_json.get("data") if isinstance(tk_json, dict) else tk_json
-                if isinstance(tk_data, list) and tk_data:
-                    tk_data = tk_data[0]
-                if isinstance(tk_data, dict):
-                    v, d = _extract_first_valid_flow(tk_data)
-                    if v is not None:
-                        funds[ticker] = v
-                        if d and not latest_date:
-                            latest_date = d
+        if "IBIT" in funds or total_val is not None:
+            if not latest_date:
+                latest_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            payload = _build_etf_payload(latest_date, funds, total_val, "SoSoValue API")
+            logger.info(f"成功通过 SoSoValue OpenAPI v1 获取 ETF 数据 ({latest_date}): Total={payload['total']:+.1f}M, IBIT={payload['ibit']:+.1f}M")
+            return payload, "OK"
 
-        if not latest_date:
-            latest_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        return _build_etf_payload(latest_date, funds, total_val, "SoSoValue API"), "OK"
+        status_hint = f"HTTP {r_list.status_code}/{r_sum.status_code}"
+        return None, f"字段未匹配({status_hint}|keys={debug_keys})"
     except Exception as e:
         logger.warning(f"SoSoValue OpenAPI v1 异常: {e}")
-        return None, "API请求超时/异常"
+        return None, "API请求异常"
 
 
 def _fetch_tftc_backup() -> Optional[Dict]:
@@ -300,7 +349,7 @@ def fetch_etf_flows() -> Optional[Dict]:
 
     tftc_res = _fetch_tftc_backup()
     if tftc_res:
-        tftc_res["source"] = f"TFTC | 降级原因: {reason}"
+        tftc_res["source"] = f"TFTC | 降级: {reason}"
         return tftc_res
     return None
 
@@ -549,7 +598,7 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V11")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V12")
     parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
     parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
     parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
@@ -557,7 +606,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V11 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V12 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     elif args.basis:

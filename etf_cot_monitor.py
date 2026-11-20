@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V7 双雷达高敏版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V8 CoinGlass 实时同步版)
 """
 
 import os
@@ -12,7 +12,7 @@ import calendar
 import logging
 import argparse
 from datetime import datetime, date, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import cloudscraper
@@ -21,13 +21,16 @@ from bs4 import BeautifulSoup
 # ==================== 1. 配置与告警阈值 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")  # 可选：若未来配置 CoinGlass 官方 API Key 可自动启用
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
 CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
-ETF_SATSINTEL_URL = "https://www.satsintel.io/en/etfs/flows"
-FARSIDE_DIRECT_URL = "https://farside.co.uk/btc/"
+COINGLASS_ETF_PAGE = "https://www.coinglass.com/etf/bitcoin"
+COINGLASS_ETF_API = "https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history"
+TFTC_ETF_URL = "https://www.tftc.io/bitcoin-etf-flows"
+BITBO_ETF_URL = "https://bitbo.io/treasuries/etf-flows/"
 
 THRESHOLDS = {
     "IBIT_HEAVY_OUTFLOW_M": -150.0,         # IBIT 单日净流出警报（百万美元）
@@ -112,109 +115,193 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块 ====================
-def parse_num(val: str) -> float:
-    s = val.strip().replace(",", "").replace("$", "").replace("M", "").replace("m", "")
+# ==================== 3. 美国现货 ETF 资金流模块（CoinGlass 实时同步） ====================
+def parse_etf_amount(val: str) -> float:
+    """统一将资金流字符串转为百万美元（$M），兼容 -541.1、-$541.1M、-541,100,000、(541.1) 等格式"""
+    s = str(val).strip().replace(",", "").replace("$", "").replace(" ", "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
-    if not s or s == "-" or s.lower() == "n/a":
+    if not s or s in ("-", "--") or s.lower() == "n/a":
         return 0.0
+
+    neg = False
     if s.startswith("(") and s.endswith(")"):
-        return -float(s[1:-1])
+        neg = True
+        s = s[1:-1]
+
+    mult = 1.0
+    if s.lower().endswith("b"):
+        mult = 1000.0
+        s = s[:-1]
+    elif s.lower().endswith("m"):
+        mult = 1.0
+        s = s[:-1]
+    elif s.lower().endswith("k"):
+        mult = 0.001
+        s = s[:-1]
+
     try:
-        return float(s)
+        num = float(s) * mult
+        if neg:
+            num = -abs(num)
+        # 若数据源直接返回原始美元（如 -541100000），自动折算为百万美元
+        if mult == 1.0 and abs(num) >= 100_000:
+            num = num / 1_000_000.0
+        return round(num, 2)
     except ValueError:
         return 0.0
 
 
+def parse_row_date(date_str: str) -> Optional[date]:
+    """解析常见美股交易日期格式用于排序，确保永远取最新已结算交易日"""
+    clean = re.sub(r"^[A-Za-z]+,\s*", "", date_str.strip()).replace(",", "")
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(clean, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _build_etf_payload(date_label: str, funds: Dict[str, float], total_val: Optional[float], source: str) -> Dict:
+    known_tickers = ("IBIT", "FBTC", "GBTC", "BTC", "BITB", "ARKB", "HODL", "BRRR", "EZBC", "BTCO", "BTCW", "MSBT", "DEFI")
+    calc_sum = round(sum(funds.get(t, 0.0) for t in known_tickers if t in funds), 2)
+    total = round(total_val, 2) if (total_val is not None and (total_val != 0.0 or calc_sum == 0.0)) else calc_sum
+    mini = round(funds.get("BTC", 0.0) + funds.get("BITB", 0.0), 2)
+    return {
+        "date": date_label,
+        "source": source,
+        "ibit": funds.get("IBIT", 0.0),
+        "fbtc": funds.get("FBTC", 0.0),
+        "gbtc": funds.get("GBTC", 0.0),
+        "mini_flow": mini,
+        "total": total,
+    }
+
+
+def _parse_wide_etf_table(soup: BeautifulSoup, source_name: str) -> Optional[Dict]:
+    """通用宽表解析器（适配 CoinGlass 与 Bitbo 的 Date/Time | GBTC | IBIT | FBTC ... | Total 结构）"""
+    for table in soup.find_all("table"):
+        headers: List[str] = []
+        dated_rows: List[Tuple[date, str, Dict[str, float], Optional[float]]] = []
+
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if not cells:
+                continue
+            upper_cells = [c.split()[0].upper() if c else "" for c in cells]
+
+            if "IBIT" in upper_cells and ("FBTC" in upper_cells or "GBTC" in upper_cells):
+                headers = upper_cells
+                continue
+
+            if headers and len(cells) >= 4:
+                raw_date = cells[0]
+                if any(k in raw_date.lower() for k in ("total", "average", "max", "min", "sum")):
+                    continue
+                dt = parse_row_date(raw_date)
+                if not dt:
+                    continue
+
+                funds: Dict[str, float] = {}
+                total_val: Optional[float] = None
+                for idx in range(1, min(len(headers), len(cells))):
+                    col = headers[idx]
+                    val = parse_etf_amount(cells[idx])
+                    if col in ("TOTAL", "TOTALS", "NET", "ALL"):
+                        total_val = val
+                    elif re.match(r"^[A-Z]{2,5}$", col):
+                        funds[col] = val
+
+                if "IBIT" in funds:
+                    dated_rows.append((dt, dt.strftime("%Y-%m-%d"), funds, total_val))
+
+        if dated_rows:
+            dated_rows.sort(key=lambda x: x[0], reverse=True)
+            _, best_date, best_funds, best_total = dated_rows[0]
+            return _build_etf_payload(best_date, best_funds, best_total, source_name)
+    return None
+
+
 def fetch_etf_flows() -> Optional[Dict]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # 通道 0（可选）：若用户配置了 CoinGlass 官方 API Key，优先直连 v4 接口
+    if COINGLASS_API_KEY:
+        try:
+            r = requests.get(
+                COINGLASS_ETF_API,
+                headers={"accept": "application/json", "CG-API-KEY": COINGLASS_API_KEY},
+                timeout=15,
+            )
+            if r.status_code == 200 and r.json().get("data"):
+                latest = sorted(r.json()["data"], key=lambda x: x.get("date", ""), reverse=True)[0]
+                funds = {item["etf_ticker"].upper(): round(float(item.get("flow_usd", 0)) / 1e6, 2) for item in latest.get("etf_flows", [])}
+                total_m = round(float(latest.get("flow_usd", 0)) / 1e6, 2)
+                return _build_etf_payload(str(latest.get("date", ""))[:10], funds, total_m, "CoinGlass API")
+        except Exception as e:
+            logger.warning(f"CoinGlass API 异常，切换网页直连通道: {e}")
+
+    # 通道 1（主源）：CoinGlass 比特币现货 ETF 实时看板（coinglass.com/etf/bitcoin）
     try:
-        resp = requests.get(ETF_SATSINTEL_URL, headers=headers, timeout=25)
+        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        resp = scraper.get(COINGLASS_ETF_PAGE, headers=headers, timeout=22)
         if resp.status_code == 200 and "IBIT" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
-            latest_date = ""
-            total_flow = 0.0
-            has_explicit_total = False
-            fund_flows: Dict[str, float] = {}
-
-            for table in soup.find_all("table"):
-                t_lower = table.get_text().lower()
-                rows = table.find_all("tr")
-                if len(rows) <= 1:
-                    continue
-                if "date" in t_lower and "flow" in t_lower and "ibit" not in t_lower:
-                    for tr in rows[1:]:
-                        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-                        if len(cells) >= 2 and re.search(r"\d", cells[0]):
-                            latest_date = cells[0]
-                            total_flow = parse_num(cells[1])
-                            has_explicit_total = True
-                            break
-                elif "ibit" in t_lower and ("latest" in t_lower or "flow" in t_lower or "fbtc" in t_lower):
-                    for tr in rows[1:]:
-                        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-                        if len(cells) >= 2:
-                            ticker = cells[0].split()[0].upper()
-                            val = parse_num(cells[1])
-                            if ticker in ("TOTAL", "NET", "ALL"):
-                                total_flow = val
-                                has_explicit_total = True
-                            elif re.match(r"^[A-Z]{2,5}$", ticker):
-                                fund_flows[ticker] = val
-
-            if fund_flows and "IBIT" in fund_flows:
-                if not has_explicit_total:
-                    total_flow = round(sum(fund_flows.values()), 2)
-                if not latest_date or not re.search(r"\b\d{1,2}\b", latest_date):
-                    date_match = re.search(
-                        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+202\d\b|\b202\d-\d{2}-\d{2}\b",
-                        soup.get_text(),
-                        re.IGNORECASE,
-                    )
-                    latest_date = date_match.group(0) if date_match else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-                mini = round(fund_flows.get("BTC", 0.0) + fund_flows.get("BITB", 0.0), 2)
-                return {
-                    "date": latest_date,
-                    "ibit": fund_flows.get("IBIT", 0.0),
-                    "fbtc": fund_flows.get("FBTC", 0.0),
-                    "gbtc": fund_flows.get("GBTC", 0.0),
-                    "mini_flow": mini,
-                    "total": total_flow,
-                }
+            parsed = _parse_wide_etf_table(soup, "CoinGlass")
+            if parsed:
+                logger.info(f"成功通过 CoinGlass 获取 ETF 数据 ({parsed['date']}): Total={parsed['total']:+.1f}M, IBIT={parsed['ibit']:+.1f}M")
+                return parsed
     except Exception as e:
-        logger.warning(f"SatsIntel 主通道异常: {e}")
+        logger.warning(f"CoinGlass 主通道异常: {e}")
 
+    # 通道 2（备用 1）：TFTC 实时 ETF 追踪表（美股盘后直连 SSR 页面）
     try:
-        scraper = cloudscraper.create_scraper()
-        resp = scraper.get(FARSIDE_DIRECT_URL, timeout=20)
-        if resp.status_code == 200:
+        resp = requests.get(TFTC_ETF_URL, headers=headers, timeout=20)
+        if resp.status_code == 200 and "IBIT" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
-            table = next((t for t in soup.find_all("table") if "IBIT" in t.get_text() and "Total" in t.get_text()), None)
-            if table:
-                hdrs, recs = [], []
-                for tr in table.find_all("tr"):
-                    cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-                    if "IBIT" in cells and "Total" in cells:
-                        hdrs = cells
-                    elif hdrs and len(cells) >= len(hdrs) and re.match(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$", cells[0]):
-                        row = {"Date": cells[0]}
-                        for i in range(1, len(hdrs)):
-                            if hdrs[i]:
-                                row[hdrs[i]] = parse_num(cells[i])
-                        recs.append(row)
-                if recs:
-                    last = recs[-1]
-                    return {
-                        "date": last["Date"],
-                        "ibit": last.get("IBIT", 0.0),
-                        "fbtc": last.get("FBTC", 0.0),
-                        "gbtc": last.get("GBTC", 0.0),
-                        "mini_flow": round(last.get("BTC", 0.0) + last.get("BITB", 0.0), 2),
-                        "total": last.get("Total", 0.0),
-                    }
+            date_match = re.search(
+                r"Latest Bitcoin ETF flows:\s*(?:[A-Za-z]+,\s*)?([A-Za-z]+\s+\d{1,2},\s+202\d)",
+                soup.get_text(),
+                re.IGNORECASE,
+            )
+            dt = parse_row_date(date_match.group(1)) if date_match else None
+            date_label = dt.strftime("%Y-%m-%d") if dt else ""
+
+            funds: Dict[str, float] = {}
+            total_val: Optional[float] = None
+            for table in soup.find_all("table"):
+                t_text = table.get_text()
+                if "IBIT" in t_text and "Net flow" in t_text:
+                    for tr in table.find_all("tr")[1:]:
+                        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                        if len(cells) >= 3:
+                            ticker = cells[0].split()[0].upper()
+                            val = parse_etf_amount(cells[2])
+                            if "ALL US SPOT" in cells[0].upper() or ticker == "TOTAL":
+                                total_val = val
+                            elif re.match(r"^[A-Z]{2,5}$", ticker):
+                                funds[ticker] = val
+                    if "IBIT" in funds and date_label:
+                        logger.info(f"成功通过 TFTC 备用通道获取 ETF 数据 ({date_label})")
+                        return _build_etf_payload(date_label, funds, total_val, "TFTC")
     except Exception as e:
-        logger.warning(f"Farside 备用通道异常: {e}")
+        logger.warning(f"TFTC 备用通道异常: {e}")
+
+    # 通道 3（备用 2）：Bitbo 实时 ETF 资金流历史表
+    try:
+        resp = requests.get(BITBO_ETF_URL, headers=headers, timeout=20)
+        if resp.status_code == 200 and "IBIT" in resp.text:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            parsed = _parse_wide_etf_table(soup, "Bitbo")
+            if parsed:
+                logger.info(f"成功通过 Bitbo 备用通道获取 ETF 数据 ({parsed['date']})")
+                return parsed
+    except Exception as e:
+        logger.warning(f"Bitbo 备用通道异常: {e}")
+
     return None
 
 
@@ -441,7 +528,7 @@ def evaluate_and_alert(force: bool = False) -> None:
         ])
     if etf:
         msg.extend([
-            f"<b>【3. 美国现货 ETF 资金流 ({etf['date']})】</b>",
+            f"<b>【3. 美国现货 ETF 资金流 ({etf['date']} | {etf['source']})】</b>",
             f"• <b>全市场总计:</b> <code>{etf['total']:+.1f}M</code> USD",
             f"• <b>贝莱德 IBIT:</b> <code>{etf['ibit']:+.1f}M</code> USD",
             f"• <b>富达 FBTC:</b> <code>{etf['fbtc']:+.1f}M</code> | <b>灰度 GBTC:</b> <code>{etf['gbtc']:+.1f}M</code>",
@@ -464,7 +551,7 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V7")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V8")
     parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
     parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
     parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
@@ -472,7 +559,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V7 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V8 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     elif args.basis:

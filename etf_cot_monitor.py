@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V8 CoinGlass 实时同步版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V9 SoSoValue API 零延迟版)
 """
 
 import os
@@ -15,22 +15,20 @@ from datetime import datetime, date, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
-import cloudscraper
 from bs4 import BeautifulSoup
 
 # ==================== 1. 配置与告警阈值 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
-COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY", "")  # 可选：若未来配置 CoinGlass 官方 API Key 可自动启用
+SOSOVALUE_API_KEY = os.getenv("SOSOVALUE_API_KEY", "")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
 CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
-COINGLASS_ETF_PAGE = "https://www.coinglass.com/etf/bitcoin"
-COINGLASS_ETF_API = "https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history"
-TFTC_ETF_URL = "https://www.tftc.io/bitcoin-etf-flows"
+SOSOVALUE_ETF_URL = "https://api.sosovalue.xyz/openapi/v2/etf/currentEtfDataMetrics"
 BITBO_ETF_URL = "https://bitbo.io/treasuries/etf-flows/"
+TFTC_ETF_URL = "https://www.tftc.io/bitcoin-etf-flows"
 
 THRESHOLDS = {
     "IBIT_HEAVY_OUTFLOW_M": -150.0,         # IBIT 单日净流出警报（百万美元）
@@ -115,9 +113,15 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块（CoinGlass 实时同步） ====================
-def parse_etf_amount(val: str) -> float:
-    """统一将资金流字符串转为百万美元（$M），兼容 -541.1、-$541.1M、-541,100,000、(541.1) 等格式"""
+# ==================== 3. 美国现货 ETF 资金流模块（SoSoValue API 主源 + 日期新鲜度竞速） ====================
+def parse_etf_amount(val) -> float:
+    """统一将资金流数值/字符串转为百万美元（$M），自动识别原始美元大额数字与 M/B 单位"""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        num = float(val)
+        return round(num / 1_000_000.0, 2) if abs(num) >= 100_000 else round(num, 2)
+
     s = str(val).strip().replace(",", "").replace("$", "").replace(" ", "")
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
     if not s or s in ("-", "--") or s.lower() == "n/a":
@@ -143,7 +147,6 @@ def parse_etf_amount(val: str) -> float:
         num = float(s) * mult
         if neg:
             num = -abs(num)
-        # 若数据源直接返回原始美元（如 -541100000），自动折算为百万美元
         if mult == 1.0 and abs(num) >= 100_000:
             num = num / 1_000_000.0
         return round(num, 2)
@@ -152,7 +155,6 @@ def parse_etf_amount(val: str) -> float:
 
 
 def parse_row_date(date_str: str) -> Optional[date]:
-    """解析常见美股交易日期格式用于排序，确保永远取最新已结算交易日"""
     clean = re.sub(r"^[A-Za-z]+,\s*", "", date_str.strip()).replace(",", "")
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y"):
         try:
@@ -178,88 +180,112 @@ def _build_etf_payload(date_label: str, funds: Dict[str, float], total_val: Opti
     }
 
 
-def _parse_wide_etf_table(soup: BeautifulSoup, source_name: str) -> Optional[Dict]:
-    """通用宽表解析器（适配 CoinGlass 与 Bitbo 的 Date/Time | GBTC | IBIT | FBTC ... | Total 结构）"""
-    for table in soup.find_all("table"):
-        headers: List[str] = []
-        dated_rows: List[Tuple[date, str, Dict[str, float], Optional[float]]] = []
+def fetch_sosovalue_etf() -> Optional[Dict]:
+    """主源：通过 SoSoValue 官方 Open API v2 实时拉取美股盘后现货 BTC ETF 结算明细"""
+    if not SOSOVALUE_API_KEY:
+        logger.info("未检测到 SOSOVALUE_API_KEY，跳过官方 API 主通道。")
+        return None
 
-        for tr in table.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-            if not cells:
+    headers = {
+        "x-soso-api-key": SOSOVALUE_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        resp = requests.post(SOSOVALUE_ETF_URL, headers=headers, json={"type": "us-btc-spot"}, timeout=20)
+        if resp.status_code != 200:
+            logger.warning(f"SoSoValue API HTTP 状态异常: {resp.status_code}")
+            return None
+
+        res_json = resp.json()
+        data = res_json.get("data") or {}
+        etf_list = data.get("list") or []
+        if not etf_list:
+            logger.warning(f"SoSoValue API 未返回明细列表: {res_json.get('msg', '')}")
+            return None
+
+        funds: Dict[str, float] = {}
+        latest_date = ""
+
+        for item in etf_list:
+            ticker = str(item.get("ticker", "")).strip().upper()
+            if not ticker:
                 continue
-            upper_cells = [c.split()[0].upper() if c else "" for c in cells]
+            inflow_obj = item.get("dailyNetInflow")
+            if isinstance(inflow_obj, dict):
+                val = parse_etf_amount(inflow_obj.get("value", 0))
+                d_str = str(inflow_obj.get("date", ""))[:10]
+                if d_str and d_str > latest_date:
+                    latest_date = d_str
+            else:
+                val = parse_etf_amount(inflow_obj if inflow_obj is not None else item.get("netInflow", 0))
+            funds[ticker] = val
 
-            if "IBIT" in upper_cells and ("FBTC" in upper_cells or "GBTC" in upper_cells):
-                headers = upper_cells
-                continue
+        total_val: Optional[float] = None
+        total_obj = data.get("dailyNetInflow")
+        if isinstance(total_obj, dict):
+            total_val = parse_etf_amount(total_obj.get("value", 0))
+            d_str = str(total_obj.get("date", ""))[:10]
+            if d_str and d_str > latest_date:
+                latest_date = d_str
+        elif total_obj is not None:
+            total_val = parse_etf_amount(total_obj)
 
-            if headers and len(cells) >= 4:
-                raw_date = cells[0]
-                if any(k in raw_date.lower() for k in ("total", "average", "max", "min", "sum")):
-                    continue
-                dt = parse_row_date(raw_date)
-                if not dt:
-                    continue
+        if not latest_date:
+            latest_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-                funds: Dict[str, float] = {}
-                total_val: Optional[float] = None
-                for idx in range(1, min(len(headers), len(cells))):
-                    col = headers[idx]
-                    val = parse_etf_amount(cells[idx])
-                    if col in ("TOTAL", "TOTALS", "NET", "ALL"):
-                        total_val = val
-                    elif re.match(r"^[A-Z]{2,5}$", col):
-                        funds[col] = val
-
-                if "IBIT" in funds:
-                    dated_rows.append((dt, dt.strftime("%Y-%m-%d"), funds, total_val))
-
-        if dated_rows:
-            dated_rows.sort(key=lambda x: x[0], reverse=True)
-            _, best_date, best_funds, best_total = dated_rows[0]
-            return _build_etf_payload(best_date, best_funds, best_total, source_name)
+        if "IBIT" in funds:
+            payload = _build_etf_payload(latest_date, funds, total_val, "SoSoValue API")
+            logger.info(f"成功通过 SoSoValue API 获取 ETF 数据 ({latest_date}): Total={payload['total']:+.1f}M, IBIT={payload['ibit']:+.1f}M")
+            return payload
+    except Exception as e:
+        logger.warning(f"SoSoValue API 请求异常，切换备用通道: {e}")
     return None
 
 
-def fetch_etf_flows() -> Optional[Dict]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    # 通道 0（可选）：若用户配置了 CoinGlass 官方 API Key，优先直连 v4 接口
-    if COINGLASS_API_KEY:
-        try:
-            r = requests.get(
-                COINGLASS_ETF_API,
-                headers={"accept": "application/json", "CG-API-KEY": COINGLASS_API_KEY},
-                timeout=15,
-            )
-            if r.status_code == 200 and r.json().get("data"):
-                latest = sorted(r.json()["data"], key=lambda x: x.get("date", ""), reverse=True)[0]
-                funds = {item["etf_ticker"].upper(): round(float(item.get("flow_usd", 0)) / 1e6, 2) for item in latest.get("etf_flows", [])}
-                total_m = round(float(latest.get("flow_usd", 0)) / 1e6, 2)
-                return _build_etf_payload(str(latest.get("date", ""))[:10], funds, total_m, "CoinGlass API")
-        except Exception as e:
-            logger.warning(f"CoinGlass API 异常，切换网页直连通道: {e}")
-
-    # 通道 1（主源）：CoinGlass 比特币现货 ETF 实时看板（coinglass.com/etf/bitcoin）
+def _fetch_bitbo_backup(headers: Dict[str, str]) -> Optional[Dict]:
     try:
-        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-        resp = scraper.get(COINGLASS_ETF_PAGE, headers=headers, timeout=22)
+        resp = requests.get(BITBO_ETF_URL, headers=headers, timeout=18)
         if resp.status_code == 200 and "IBIT" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
-            parsed = _parse_wide_etf_table(soup, "CoinGlass")
-            if parsed:
-                logger.info(f"成功通过 CoinGlass 获取 ETF 数据 ({parsed['date']}): Total={parsed['total']:+.1f}M, IBIT={parsed['ibit']:+.1f}M")
-                return parsed
+            for table in soup.find_all("table"):
+                hdrs: List[str] = []
+                dated_rows: List[Tuple[date, str, Dict[str, float], Optional[float]]] = []
+                for tr in table.find_all("tr"):
+                    cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                    if not cells:
+                        continue
+                    upper_cells = [c.split()[0].upper() if c else "" for c in cells]
+                    if "IBIT" in upper_cells and ("FBTC" in upper_cells or "GBTC" in upper_cells):
+                        hdrs = upper_cells
+                        continue
+                    if hdrs and len(cells) >= 4:
+                        dt = parse_row_date(cells[0])
+                        if not dt:
+                            continue
+                        funds: Dict[str, float] = {}
+                        total_val: Optional[float] = None
+                        for idx in range(1, min(len(hdrs), len(cells))):
+                            col = hdrs[idx]
+                            val = parse_etf_amount(cells[idx])
+                            if col in ("TOTAL", "TOTALS", "NET", "ALL"):
+                                total_val = val
+                            elif re.match(r"^[A-Z]{2,5}$", col):
+                                funds[col] = val
+                        if "IBIT" in funds:
+                            dated_rows.append((dt, dt.strftime("%Y-%m-%d"), funds, total_val))
+                if dated_rows:
+                    dated_rows.sort(key=lambda x: x[0], reverse=True)
+                    _, best_date, best_funds, best_total = dated_rows[0]
+                    return _build_etf_payload(best_date, best_funds, best_total, "Bitbo")
     except Exception as e:
-        logger.warning(f"CoinGlass 主通道异常: {e}")
+        logger.warning(f"Bitbo 备用通道异常: {e}")
+    return None
 
-    # 通道 2（备用 1）：TFTC 实时 ETF 追踪表（美股盘后直连 SSR 页面）
+
+def _fetch_tftc_backup(headers: Dict[str, str]) -> Optional[Dict]:
     try:
-        resp = requests.get(TFTC_ETF_URL, headers=headers, timeout=20)
+        resp = requests.get(TFTC_ETF_URL, headers=headers, timeout=18)
         if resp.status_code == 200 and "IBIT" in resp.text:
             soup = BeautifulSoup(resp.text, "html.parser")
             date_match = re.search(
@@ -269,7 +295,6 @@ def fetch_etf_flows() -> Optional[Dict]:
             )
             dt = parse_row_date(date_match.group(1)) if date_match else None
             date_label = dt.strftime("%Y-%m-%d") if dt else ""
-
             funds: Dict[str, float] = {}
             total_val: Optional[float] = None
             for table in soup.find_all("table"):
@@ -285,23 +310,26 @@ def fetch_etf_flows() -> Optional[Dict]:
                             elif re.match(r"^[A-Z]{2,5}$", ticker):
                                 funds[ticker] = val
                     if "IBIT" in funds and date_label:
-                        logger.info(f"成功通过 TFTC 备用通道获取 ETF 数据 ({date_label})")
                         return _build_etf_payload(date_label, funds, total_val, "TFTC")
     except Exception as e:
         logger.warning(f"TFTC 备用通道异常: {e}")
+    return None
 
-    # 通道 3（备用 2）：Bitbo 实时 ETF 资金流历史表
-    try:
-        resp = requests.get(BITBO_ETF_URL, headers=headers, timeout=20)
-        if resp.status_code == 200 and "IBIT" in resp.text:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            parsed = _parse_wide_etf_table(soup, "Bitbo")
-            if parsed:
-                logger.info(f"成功通过 Bitbo 备用通道获取 ETF 数据 ({parsed['date']})")
-                return parsed
-    except Exception as e:
-        logger.warning(f"Bitbo 备用通道异常: {e}")
 
+def fetch_etf_flows() -> Optional[Dict]:
+    # 1. 优先直连 SoSoValue 官方 API（零延迟）
+    soso_res = fetch_sosovalue_etf()
+    if soso_res:
+        return soso_res
+
+    # 2. 备用网页通道：同时采集 Bitbo 与 TFTC 并按日期新鲜度取最新
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    candidates = [res for res in (_fetch_bitbo_backup(headers), _fetch_tftc_backup(headers)) if res]
+    if candidates:
+        candidates.sort(key=lambda x: x["date"], reverse=True)
+        best = candidates[0]
+        logger.info(f"使用备用通道最新 ETF 数据 ({best['date']} | {best['source']})")
+        return best
     return None
 
 
@@ -551,7 +579,7 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V8")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V9")
     parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
     parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
     parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
@@ -559,7 +587,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V8 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V9 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     elif args.basis:

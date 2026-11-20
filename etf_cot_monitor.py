@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V10 SoSoValue OpenAPI v1 正式版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V11 SoSoValue OpenAPI v1 诊断增强版)
 """
 
 import os
@@ -12,7 +12,7 @@ import calendar
 import logging
 import argparse
 from datetime import datetime, date, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,14 +20,13 @@ from bs4 import BeautifulSoup
 # ==================== 1. 配置与告警阈值 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
-SOSOVALUE_API_KEY = os.getenv("SOSOVALUE_API_KEY", "")
+SOSOVALUE_API_KEY = os.getenv("SOSOVALUE_API_KEY", "").strip()
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor.log")
 
 CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 SOSOVALUE_V1_BASE = "https://openapi.sosovalue.com/openapi/v1"
-BITBO_ETF_URL = "https://bitbo.io/treasuries/etf-flows/"
 TFTC_ETF_URL = "https://www.tftc.io/bitcoin-etf-flows"
 
 THRESHOLDS = {
@@ -115,7 +114,6 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
 
 # ==================== 3. 美国现货 ETF 资金流模块（SoSoValue OpenAPI v1 主源） ====================
 def parse_etf_amount(val) -> Optional[float]:
-    """将金额转为百万美元（$M），若为空或 null 返回 None"""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -181,7 +179,6 @@ def _build_etf_payload(date_label: str, funds: Dict[str, float], total_val: Opti
 
 
 def _extract_first_valid_flow(obj: Dict) -> Tuple[Optional[float], str]:
-    """兼容蛇形与驼峰命名提取单条记录的净流入与日期"""
     flow_keys = ("net_inflow", "netInflow", "daily_net_inflow", "dailyNetInflow", "flow", "latest_net_inflow")
     date_keys = ("date", "trade_date", "tradeDate", "snapshot_date", "time", "updated_at")
     val = None
@@ -198,11 +195,10 @@ def _extract_first_valid_flow(obj: Dict) -> Tuple[Optional[float], str]:
     return val, d_str
 
 
-def fetch_sosovalue_etf() -> Optional[Dict]:
-    """主源：通过 SoSoValue OpenAPI v1 (openapi.sosovalue.com) 实时拉取 US BTC 现货 ETF 数据"""
+def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
+    """返回 (payload, 失败诊断原因)"""
     if not SOSOVALUE_API_KEY:
-        logger.info("未检测到 SOSOVALUE_API_KEY，跳过官方 API 主通道。")
-        return None
+        return None, "未检测到SOSOVALUE_API_KEY"
 
     headers = {
         "x-soso-api-key": SOSOVALUE_API_KEY,
@@ -210,20 +206,18 @@ def fetch_sosovalue_etf() -> Optional[Dict]:
         "User-Agent": "Mozilla/5.0",
     }
     try:
-        # 1. 拉取全市场汇总历史（跳过 T+1 尚未结算的 null 行）
         sum_url = f"{SOSOVALUE_V1_BASE}/etfs/summary-history"
         r_sum = requests.get(sum_url, headers=headers, params={"symbol": "BTC", "country_code": "US", "limit": 5}, timeout=15)
         if r_sum.status_code != 200:
-            logger.warning(f"SoSoValue summary-history HTTP 异常: {r_sum.status_code} | {r_sum.text[:150]}")
-            return None
+            logger.warning(f"SoSoValue summary-history HTTP {r_sum.status_code}: {r_sum.text[:150]}")
+            return None, f"API HTTP {r_sum.status_code}"
 
         raw_sum = r_sum.json()
         rows = raw_sum.get("data") if isinstance(raw_sum, dict) else raw_sum
         if isinstance(rows, dict):
             rows = rows.get("list") or rows.get("records") or rows.get("items") or []
         if not isinstance(rows, list) or not rows:
-            logger.warning("SoSoValue summary-history 返回列表为空。")
-            return None
+            return None, "API返回列表为空"
 
         total_val: Optional[float] = None
         latest_date = ""
@@ -236,10 +230,8 @@ def fetch_sosovalue_etf() -> Optional[Dict]:
                     break
 
         if total_val is None:
-            logger.warning("SoSoValue summary-history 近期行净流入字段均为空。")
-            return None
+            return None, "API净流入字段为空"
 
-        # 2. 拉取核心单只 ETF 最新快照（IBIT, FBTC, GBTC, BTC, BITB）
         funds: Dict[str, float] = {}
         for ticker in ("IBIT", "FBTC", "GBTC", "BTC", "BITB"):
             snap_url = f"{SOSOVALUE_V1_BASE}/etfs/{ticker}/market-snapshot"
@@ -259,58 +251,14 @@ def fetch_sosovalue_etf() -> Optional[Dict]:
         if not latest_date:
             latest_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        payload = _build_etf_payload(latest_date, funds, total_val, "SoSoValue API")
-        logger.info(f"成功通过 SoSoValue OpenAPI v1 获取 ETF 数据 ({latest_date}): Total={payload['total']:+.1f}M, IBIT={payload['ibit']:+.1f}M")
-        return payload
+        return _build_etf_payload(latest_date, funds, total_val, "SoSoValue API"), "OK"
     except Exception as e:
-        logger.warning(f"SoSoValue OpenAPI v1 请求异常，切换备用通道: {e}")
-    return None
+        logger.warning(f"SoSoValue OpenAPI v1 异常: {e}")
+        return None, "API请求超时/异常"
 
 
-def _fetch_bitbo_backup(headers: Dict[str, str]) -> Optional[Dict]:
-    try:
-        resp = requests.get(BITBO_ETF_URL, headers=headers, timeout=18)
-        if resp.status_code == 200 and "IBIT" in resp.text:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for table in soup.find_all("table"):
-                hdrs: List[str] = []
-                dated_rows: List[Tuple[date, str, Dict[str, float], Optional[float]]] = []
-                for tr in table.find_all("tr"):
-                    cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-                    if not cells:
-                        continue
-                    upper_cells = [c.split()[0].upper() if c else "" for c in cells]
-                    if "IBIT" in upper_cells and ("FBTC" in upper_cells or "GBTC" in upper_cells):
-                        hdrs = upper_cells
-                        continue
-                    if hdrs and len(cells) >= 4:
-                        dt = parse_row_date(cells[0])
-                        if not dt:
-                            continue
-                        funds: Dict[str, float] = {}
-                        total_val: Optional[float] = None
-                        for idx in range(1, min(len(hdrs), len(cells))):
-                            col = hdrs[idx]
-                            val = parse_etf_amount(cells[idx])
-                            if val is None:
-                                continue
-                            if col in ("TOTAL", "TOTALS", "NET", "ALL"):
-                                total_val = val
-                            elif re.match(r"^[A-Z]{2,5}$", col):
-                                funds[col] = val
-                        # 过滤掉 Bitbo 尚未填完大头基金（IBIT 与 FBTC 均缺失/为 0）的半成品行
-                        if "IBIT" in funds and not (funds.get("IBIT", 0.0) == 0.0 and funds.get("FBTC", 0.0) == 0.0):
-                            dated_rows.append((dt, dt.strftime("%Y-%m-%d"), funds, total_val))
-                if dated_rows:
-                    dated_rows.sort(key=lambda x: x[0], reverse=True)
-                    _, best_date, best_funds, best_total = dated_rows[0]
-                    return _build_etf_payload(best_date, best_funds, best_total, "Bitbo")
-    except Exception as e:
-        logger.warning(f"Bitbo 备用通道异常: {e}")
-    return None
-
-
-def _fetch_tftc_backup(headers: Dict[str, str]) -> Optional[Dict]:
+def _fetch_tftc_backup() -> Optional[Dict]:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         resp = requests.get(TFTC_ETF_URL, headers=headers, timeout=18)
         if resp.status_code == 200 and "IBIT" in resp.text:
@@ -346,19 +294,14 @@ def _fetch_tftc_backup(headers: Dict[str, str]) -> Optional[Dict]:
 
 
 def fetch_etf_flows() -> Optional[Dict]:
-    # 1. 优先直连 SoSoValue OpenAPI v1
-    soso_res = fetch_sosovalue_etf()
+    soso_res, reason = fetch_sosovalue_etf()
     if soso_res:
         return soso_res
 
-    # 2. 备用通道：Bitbo 与 TFTC 按完整结算日期新鲜度竞速
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    candidates = [res for res in (_fetch_bitbo_backup(headers), _fetch_tftc_backup(headers)) if res]
-    if candidates:
-        candidates.sort(key=lambda x: x["date"], reverse=True)
-        best = candidates[0]
-        logger.info(f"使用备用通道最新完整 ETF 数据 ({best['date']} | {best['source']})")
-        return best
+    tftc_res = _fetch_tftc_backup()
+    if tftc_res:
+        tftc_res["source"] = f"TFTC | 降级原因: {reason}"
+        return tftc_res
     return None
 
 
@@ -451,7 +394,6 @@ def fetch_basis_and_treasury(spot_price: Optional[float]) -> Optional[Dict]:
 
 # ==================== 5. 两大高频静默雷达 (--intraday & --basis) ====================
 def run_intraday_coinbase_radar() -> None:
-    """美盘时段每 10 分钟扫描 Coinbase 溢价：仅触发由负转正或吸筹底背离时推送"""
     state = load_state()
     cb = fetch_coinbase_premium()
     if not cb:
@@ -478,7 +420,6 @@ def run_intraday_coinbase_radar() -> None:
 
 
 def run_cme_basis_radar() -> None:
-    """每 30 分钟扫描 CME 期货基差：监测是否结束贴水（由负转正）"""
     state = load_state()
     cb = fetch_coinbase_premium()
     macro = fetch_basis_and_treasury(cb["cb_price"] if cb else None)
@@ -608,7 +549,7 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V10")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V11")
     parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
     parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
     parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
@@ -616,7 +557,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V10 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V11 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     elif args.basis:

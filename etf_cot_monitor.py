@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V12 SoSoValue 智能字段自适应版)
+华尔街 BTC 机构资金、衍生品与宏观利差全因子监控告警脚本 (V13 全基金明细增强版)
 """
 
 import os
@@ -29,10 +29,12 @@ CFTC_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 SOSOVALUE_V1_BASE = "https://openapi.sosovalue.com/openapi/v1"
 TFTC_ETF_URL = "https://www.tftc.io/bitcoin-etf-flows"
 
+CORE_ETF_TICKERS = ("IBIT", "FBTC", "GBTC", "BTC", "BITB", "MSBT", "BTCW", "ARKB")
+
 THRESHOLDS = {
     "IBIT_HEAVY_OUTFLOW_M": -150.0,         # IBIT 单日净流出警报（百万美元）
     "TOTAL_INFLOW_ALERT_M": 100.0,          # 全市场 ETF 单日净流入警报（百万美元）
-    "IBIT_INFLOW_STREAK_DAYS": 2,           # IBIT 连续净流入右侧反转天数
+    "MSBT_COUNTER_INFLOW_M": 20.0,          # 摩根士丹利 MSBT 逆势净流入阈值（百万美元）
     "COT_NET_CHANGE_CONTRACTS": 1000,       # CFTC 杠杆基金单周调仓张数警报
     "COT_UNWIND_EXHAUSTED_CONTRACTS": 3000, # CFTC 杠杆基金套利空头枯竭阈值
     "BASIS_EXCESS_SPREAD_ALERT": 2.0,       # CME 年化基差高于 10Y 美债 2% 警报
@@ -112,7 +114,7 @@ def fetch_cftc_btc_cot() -> Optional[Dict]:
     return None
 
 
-# ==================== 3. 美国现货 ETF 资金流模块（SoSoValue 智能字段自适应） ====================
+# ==================== 3. 美国现货 ETF 资金流模块（SoSoValue 全基金明细版） ====================
 def parse_etf_amount(val: Any) -> Optional[float]:
     if val is None or isinstance(val, bool):
         return None
@@ -173,13 +175,15 @@ def _build_etf_payload(date_label: str, funds: Dict[str, float], total_val: Opti
         "ibit": funds.get("IBIT", 0.0),
         "fbtc": funds.get("FBTC", 0.0),
         "gbtc": funds.get("GBTC", 0.0),
+        "arkb": funds.get("ARKB", 0.0),
+        "msbt": funds.get("MSBT", 0.0),
+        "btcw": funds.get("BTCW", 0.0),
         "mini_flow": mini,
         "total": total,
     }
 
 
 def _smart_extract_flow(obj: Dict) -> Tuple[Optional[float], str]:
-    """自适应提取净流入金额与日期，兼容任意命名风格及嵌套字典"""
     d_str = ""
     for k, v in obj.items():
         kl = k.lower()
@@ -189,7 +193,6 @@ def _smart_extract_flow(obj: Dict) -> Tuple[Optional[float], str]:
                 d_str = m.group(0)
                 break
 
-    # 第一优先级：明确包含 inflow / flow 且非累计值（cum / cumulative）的字段
     for k, v in obj.items():
         kl = k.lower()
         if ("inflow" in kl or "flow" in kl) and not any(ex in kl for ex in ("cum", "status", "type", "rate", "pct", "ratio")):
@@ -202,7 +205,6 @@ def _smart_extract_flow(obj: Dict) -> Tuple[Optional[float], str]:
                 if parsed is not None:
                     return parsed, d_str
 
-    # 第二优先级：若存在 value / amount 等通用数值字段（常用于 nested flow 对象内部）
     for k in ("value", "amount", "usd", "net"):
         if k in obj and obj[k] is not None and not isinstance(obj[k], (dict, list)):
             parsed = parse_etf_amount(obj[k])
@@ -228,7 +230,6 @@ def _unwrap_list(raw: Any) -> List[Dict]:
 
 
 def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
-    """主源：SoSoValue OpenAPI v1 批量 ETF 列表 + 汇总历史双重校验"""
     if not SOSOVALUE_API_KEY:
         return None, "未检测到SOSOVALUE_API_KEY"
 
@@ -242,7 +243,7 @@ def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
         latest_date = ""
         debug_keys = ""
 
-        # 步骤 1：优先调用批量基金列表接口 GET /etfs?symbol=BTC&country_code=US（一次拿全所有 ETF 最新值）
+        # 步骤 1：批量拉取 US BTC 现货 ETF 列表
         list_url = f"{SOSOVALUE_V1_BASE}/etfs"
         r_list = requests.get(list_url, headers=headers, params={"symbol": "BTC", "country_code": "US"}, timeout=15)
         if r_list.status_code == 200:
@@ -259,7 +260,7 @@ def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
                     if d and d > latest_date:
                         latest_date = d
 
-        # 步骤 2：调用汇总历史接口 GET /etfs/summary-history 获取官方全市场总净流入（跳过 T+1 空值行）
+        # 步骤 2：拉取官方汇总历史（跳过 T+1 未结算空值行）
         total_val: Optional[float] = None
         sum_url = f"{SOSOVALUE_V1_BASE}/etfs/summary-history"
         r_sum = requests.get(sum_url, headers=headers, params={"symbol": "BTC", "country_code": "US", "limit": 5}, timeout=15)
@@ -275,28 +276,32 @@ def fetch_sosovalue_etf() -> Tuple[Optional[Dict], str]:
                         latest_date = d
                     break
 
-        # 步骤 3：若批量接口未拿到核心单只 ETF，补调 market-snapshot
-        if "IBIT" not in funds:
-            for ticker in ("IBIT", "FBTC", "GBTC", "BTC", "BITB"):
-                snap_url = f"{SOSOVALUE_V1_BASE}/etfs/{ticker}/market-snapshot"
-                r_tk = requests.get(snap_url, headers=headers, timeout=12)
-                if r_tk.status_code == 200:
-                    tk_raw = r_tk.json()
-                    tk_obj = tk_raw.get("data") if isinstance(tk_raw, dict) else tk_raw
-                    if isinstance(tk_obj, list) and tk_obj:
-                        tk_obj = tk_obj[0]
-                    if isinstance(tk_obj, dict):
-                        v, d = _smart_extract_flow(tk_obj)
-                        if v is not None:
-                            funds[ticker] = v
-                            if d and d > latest_date:
-                                latest_date = d
+        # 步骤 3：对核心基金（含 MSBT、BTCW、ARKB）逐一补齐缺失快照
+        for ticker in CORE_ETF_TICKERS:
+            if ticker in funds:
+                continue
+            snap_url = f"{SOSOVALUE_V1_BASE}/etfs/{ticker}/market-snapshot"
+            r_tk = requests.get(snap_url, headers=headers, timeout=12)
+            if r_tk.status_code == 200:
+                tk_raw = r_tk.json()
+                tk_obj = tk_raw.get("data") if isinstance(tk_raw, dict) else tk_raw
+                if isinstance(tk_obj, list) and tk_obj:
+                    tk_obj = tk_obj[0]
+                if isinstance(tk_obj, dict):
+                    v, d = _smart_extract_flow(tk_obj)
+                    if v is not None:
+                        funds[ticker] = v
+                        if d and d > latest_date:
+                            latest_date = d
 
         if "IBIT" in funds or total_val is not None:
             if not latest_date:
                 latest_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             payload = _build_etf_payload(latest_date, funds, total_val, "SoSoValue API")
-            logger.info(f"成功通过 SoSoValue OpenAPI v1 获取 ETF 数据 ({latest_date}): Total={payload['total']:+.1f}M, IBIT={payload['ibit']:+.1f}M")
+            logger.info(
+                f"成功通过 SoSoValue API 获取 ETF ({latest_date}): Total={payload['total']:+.1f}M, "
+                f"IBIT={payload['ibit']:+.1f}M, MSBT={payload['msbt']:+.1f}M, BTCW={payload['btcw']:+.1f}M"
+            )
             return payload, "OK"
 
         status_hint = f"HTTP {r_list.status_code}/{r_sum.status_code}"
@@ -521,8 +526,8 @@ def evaluate_and_alert(force: bool = False) -> None:
             alerts.append(f"🚨 <b>IBIT 大额失血</b>：单日净流出 ${abs(etf['ibit']):.1f}M")
         if etf["total"] >= THRESHOLDS["TOTAL_INFLOW_ALERT_M"]:
             alerts.append(f"🟢 <b>ETF 整体大幅净流入</b>：单日净流入 +${etf['total']:.1f}M")
-        if etf["ibit"] < -50 and etf["mini_flow"] > 0:
-            alerts.append("⚠️ <b>筹码结构分化</b>：IBIT 流出，但低费率迷你 ETF 保持净流入")
+        if etf["ibit"] < -50 and (etf["mini_flow"] > 0 or etf["msbt"] >= THRESHOLDS["MSBT_COUNTER_INFLOW_M"]):
+            alerts.append("⚠️ <b>机构筹码分化</b>：IBIT 大额流出，但摩根士丹利/低费率盘出现逆势净流入")
 
     if cot:
         if cot["report_date"] != state.get("last_cot_date"):
@@ -577,8 +582,9 @@ def evaluate_and_alert(force: bool = False) -> None:
         msg.extend([
             f"<b>【3. 美国现货 ETF 资金流 ({etf['date']} | {etf['source']})】</b>",
             f"• <b>全市场总计:</b> <code>{etf['total']:+.1f}M</code> USD",
-            f"• <b>贝莱德 IBIT:</b> <code>{etf['ibit']:+.1f}M</code> USD",
-            f"• <b>富达 FBTC:</b> <code>{etf['fbtc']:+.1f}M</code> | <b>灰度 GBTC:</b> <code>{etf['gbtc']:+.1f}M</code>",
+            f"• <b>贝莱德 IBIT:</b> <code>{etf['ibit']:+.1f}M</code> | <b>富达 FBTC:</b> <code>{etf['fbtc']:+.1f}M</code>",
+            f"• <b>灰度 GBTC:</b> <code>{etf['gbtc']:+.1f}M</code> | <b>ARKB:</b> <code>{etf['arkb']:+.1f}M</code>",
+            f"• <b>摩根士丹利 MSBT:</b> <code>{etf['msbt']:+.1f}M</code> | <b>智慧树 BTCW:</b> <code>{etf['btcw']:+.1f}M</code>",
             f"• <b>低费率迷你盘 (BTC+BITB):</b> <code>{etf['mini_flow']:+.1f}M</code>\n",
         ])
     else:
@@ -598,7 +604,7 @@ def evaluate_and_alert(force: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V12")
+    parser = argparse.ArgumentParser(description="BTC 全因子机构监控脚本 V13")
     parser.add_argument("--force", action="store_true", help="强制推送全因子战报")
     parser.add_argument("--intraday", action="store_true", help="美盘 10 分钟 Coinbase 溢价静默雷达")
     parser.add_argument("--basis", action="store_true", help="30 分钟 CME 期货结束贴水静默雷达")
@@ -606,7 +612,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test:
-        send_telegram_message("✅ <b>BTC 监控节点 V12 测试成功</b>")
+        send_telegram_message("✅ <b>BTC 监控节点 V13 测试成功</b>")
     elif args.intraday:
         run_intraday_coinbase_radar()
     elif args.basis:
